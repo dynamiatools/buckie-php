@@ -1,0 +1,772 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+// Support both global install (vendor/bin/buckie) and local (bin/buckie)
+$autoloadCandidates = [
+    __DIR__ . '/../vendor/autoload.php',
+    __DIR__ . '/../../autoload.php',
+    __DIR__ . '/../../../autoload.php',
+];
+
+$loaded = false;
+foreach ($autoloadCandidates as $autoload) {
+    if (file_exists($autoload)) {
+        require_once $autoload;
+        $loaded = true;
+        break;
+    }
+}
+
+if (!$loaded) {
+    fwrite(STDERR, "Error: autoload.php not found. Run 'composer install' first.\n");
+    exit(1);
+}
+
+use Buckie\Auth\IdentityService;
+use Buckie\Config\ConfigService;
+use Buckie\Logging\OperationalLogger;
+use Buckie\Storage\BucketService;
+use Buckie\Storage\LocalStorageService;
+
+// ── Bootstrap ─────────────────────────────────────────────────────────────────
+
+$argv  = $_SERVER['argv'];
+$argc  = $_SERVER['argc'];
+
+// Remove script name
+array_shift($argv);
+
+$command = implode(' ', array_slice($argv, 0, 2)); // e.g. "create bucket"
+$subCmd  = $argv[0] ?? '';
+
+// ── Global --data-dir resolver ────────────────────────────────────────────────
+
+function getDataDirFromArgs(array $args): string
+{
+    foreach ($args as $i => $arg) {
+        if ($arg === '--data-dir' && isset($args[$i + 1])) {
+            return $args[$i + 1];
+        }
+    }
+    return ConfigService::getDataDir();
+}
+
+function getFlag(array $args, string $flag): bool
+{
+    return in_array($flag, $args, true);
+}
+
+function getOption(array $args, string $option, ?string $default = null): ?string
+{
+    foreach ($args as $i => $arg) {
+        if ($arg === $option && isset($args[$i + 1])) {
+            return $args[$i + 1];
+        }
+    }
+    return $default;
+}
+
+function getMultiOption(array $args, string $option): array
+{
+    $values = [];
+    foreach ($args as $i => $arg) {
+        if ($arg === $option && isset($args[$i + 1])) {
+            $values[] = $args[$i + 1];
+        }
+    }
+    return $values;
+}
+
+function printJson(mixed $data): void
+{
+    echo json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n";
+}
+
+function printError(string $code, string $message, int $exit = 1): never
+{
+    fwrite(STDERR, json_encode(['ok' => false, 'error' => ['code' => $code, 'message' => $message]], JSON_PRETTY_PRINT) . "\n");
+    exit($exit);
+}
+
+function printThrowable(\Throwable $e): never
+{
+    if ($e instanceof \Buckie\Errors\BuckieException) {
+        fwrite(STDERR, json_encode($e->toArray(), JSON_PRETTY_PRINT) . "\n");
+    } else {
+        printError('BUCKIE_ERROR', $e->getMessage());
+    }
+    exit(1);
+}
+
+function bootstrapServices(string $dataDir): array
+{
+    ConfigService::ensureDataDirs($dataDir);
+    return [
+        'bucketService'   => new BucketService($dataDir),
+        'identityService' => new IdentityService($dataDir),
+        'storageService'  => null, // lazy
+        'logger'          => new OperationalLogger($dataDir),
+        'dataDir'         => $dataDir,
+    ];
+}
+
+function getStorageService(array &$services): LocalStorageService
+{
+    if ($services['storageService'] === null) {
+        $services['storageService'] = new LocalStorageService($services['bucketService']);
+    }
+    return $services['storageService'];
+}
+
+// ── Help / version ────────────────────────────────────────────────────────────
+
+if (in_array($subCmd, ['--help', '-h', 'help', '']) || $argc === 0) {
+    printUsage();
+    exit(0);
+}
+
+if (in_array($subCmd, ['--version', '-v'])) {
+    echo "buckie 1.0.0 (PHP " . PHP_VERSION . ")\n";
+    exit(0);
+}
+
+// ── Route commands ────────────────────────────────────────────────────────────
+
+switch ($subCmd) {
+    case 'serve':
+        cmdServe($argv);
+        break;
+
+    case 'create':
+        $sub = $argv[1] ?? '';
+        match ($sub) {
+            'bucket'   => cmdCreateBucket(array_slice($argv, 2)),
+            'identity' => cmdCreateIdentity(array_slice($argv, 2)),
+            default    => printError('BUCKIE_INVALID_ARGS', "Unknown create subcommand '{$sub}'. Use: bucket | identity"),
+        };
+        break;
+
+    case 'list':
+        $sub = $argv[1] ?? '';
+        match ($sub) {
+            'buckets'    => cmdListBuckets(array_slice($argv, 2)),
+            'identities' => cmdListIdentities(array_slice($argv, 2)),
+            'files'      => cmdListFiles(array_slice($argv, 2)),
+            default      => printError('BUCKIE_INVALID_ARGS', "Unknown list subcommand '{$sub}'. Use: buckets | identities | files"),
+        };
+        break;
+
+    case 'remove':
+        $sub = $argv[1] ?? '';
+        match ($sub) {
+            'bucket'   => cmdRemoveBucket(array_slice($argv, 2)),
+            'identity' => cmdRemoveIdentity(array_slice($argv, 2)),
+            default    => printError('BUCKIE_INVALID_ARGS', "Unknown remove subcommand '{$sub}'. Use: bucket | identity"),
+        };
+        break;
+
+    case 'grant':
+        cmdGrant(array_slice($argv, 1));
+        break;
+
+    case 'revoke':
+        cmdRevoke(array_slice($argv, 1));
+        break;
+
+    case 'upload':
+        cmdUpload(array_slice($argv, 1));
+        break;
+
+    case 'copy':
+        cmdCopy(array_slice($argv, 1));
+        break;
+
+    case 'provision':
+        cmdProvision(array_slice($argv, 1));
+        break;
+
+    case 'completion':
+        cmdCompletion(array_slice($argv, 1));
+        break;
+
+    default:
+        printError('BUCKIE_INVALID_ARGS', "Unknown command '{$subCmd}'. Run 'buckie --help' for usage.");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Command implementations
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── serve ─────────────────────────────────────────────────────────────────────
+
+function cmdServe(array $args): never
+{
+    $host    = getOption($args, '--host',      getenv('BUCKIE_HOST') ?: '0.0.0.0');
+    $port    = getOption($args, '--port',      getenv('BUCKIE_PORT') ?: '8080');
+    $dataDir = getOption($args, '--data-dir',  ConfigService::getDataDir());
+
+    ConfigService::ensureDataDirs($dataDir);
+
+    $publicDir = dirname(__DIR__) . '/public';
+    if (!is_dir($publicDir)) {
+        printError('BUCKIE_ERROR', "Public directory not found: {$publicDir}");
+    }
+
+    putenv("BUCKIE_DATA_DIR={$dataDir}");
+
+    $phpBinary = PHP_BINARY;
+    $address   = "{$host}:{$port}";
+
+    printEnvInfo();
+
+    echo "┌─────────────────────────────────────────────\n";
+    echo "│  Buckie development server\n";
+    echo "│  Listening on http://{$address}\n";
+    echo "│  Data dir : {$dataDir}\n";
+    echo "│  Press Ctrl+C to stop\n";
+    echo "└─────────────────────────────────────────────\n";
+
+    printServerSummary($dataDir);
+
+    // Start PHP built-in server
+    $cmd = escapeshellarg($phpBinary) . ' -S ' . escapeshellarg($address) . ' -t ' . escapeshellarg($publicDir);
+    passthru($cmd, $exitCode);
+    exit($exitCode);
+}
+
+// ── create bucket ─────────────────────────────────────────────────────────────
+
+function cmdCreateBucket(array $args): void
+{
+    $name    = $args[0] ?? null;
+    $path    = $args[1] ?? null;
+    $dataDir = getDataDirFromArgs($args);
+
+    if ($name === null || $path === null) {
+        printError('BUCKIE_INVALID_ARGS', 'Usage: buckie create bucket <name> <absolutePath>');
+    }
+
+    $services = bootstrapServices($dataDir);
+    try {
+        $bucket = $services['bucketService']->create($name, $path);
+        printJson(['ok' => true, 'data' => $bucket]);
+    } catch (\Throwable $e) {
+        printThrowable($e);
+    }
+}
+
+// ── create identity ───────────────────────────────────────────────────────────
+
+function cmdCreateIdentity(array $args): void
+{
+    $identity = $args[0] ?? null;
+    $secret   = $args[1] ?? null;
+    $dataDir  = getDataDirFromArgs($args);
+
+    if ($identity === null || $secret === null) {
+        printError('BUCKIE_INVALID_ARGS', 'Usage: buckie create identity <identity> <secret>');
+    }
+
+    $services = bootstrapServices($dataDir);
+    try {
+        $id     = $services['identityService']->create($identity, $secret);
+        $safeId = array_merge($id, ['hashedSecret' => '[REDACTED]']);
+        printJson(['ok' => true, 'data' => $safeId]);
+    } catch (\Throwable $e) {
+        printThrowable($e);
+    }
+}
+
+// ── list buckets ──────────────────────────────────────────────────────────────
+
+function cmdListBuckets(array $args): void
+{
+    $dataDir  = getDataDirFromArgs($args);
+    $services = bootstrapServices($dataDir);
+    try {
+        $buckets = $services['bucketService']->list();
+        printJson(['ok' => true, 'data' => $buckets]);
+    } catch (\Throwable $e) {
+        printThrowable($e);
+    }
+}
+
+// ── list identities ───────────────────────────────────────────────────────────
+
+function cmdListIdentities(array $args): void
+{
+    $dataDir  = getDataDirFromArgs($args);
+    $services = bootstrapServices($dataDir);
+    try {
+        $ids     = $services['identityService']->list();
+        $safeIds = array_map(fn($id) => array_merge($id, ['hashedSecret' => '[REDACTED]']), $ids);
+        printJson(['ok' => true, 'data' => $safeIds]);
+    } catch (\Throwable $e) {
+        printThrowable($e);
+    }
+}
+
+// ── list files ────────────────────────────────────────────────────────────────
+
+function cmdListFiles(array $args): void
+{
+    $bucketName = $args[0] ?? null;
+    $keyPath    = isset($args[1]) && !str_starts_with($args[1], '--') ? $args[1] : null;
+    $dataDir    = getDataDirFromArgs($args);
+    $limit      = (int) (getOption($args, '--limit') ?? 100);
+    $cursor     = getOption($args, '--cursor');
+
+    if ($bucketName === null) {
+        printError('BUCKIE_INVALID_ARGS', 'Usage: buckie list files <bucket> [path]');
+    }
+
+    $services = bootstrapServices($dataDir);
+    try {
+        $bucket  = $services['bucketService']->get($bucketName);
+        $storage = getStorageService($services);
+
+        $result = $keyPath !== null
+            ? $storage->listDirectory($bucket, $keyPath)
+            : $storage->listBucket($bucket, $limit, $cursor);
+
+        printJson(['ok' => true, 'data' => $result]);
+    } catch (\Throwable $e) {
+        printThrowable($e);
+    }
+}
+
+// ── remove bucket ─────────────────────────────────────────────────────────────
+
+function cmdRemoveBucket(array $args): void
+{
+    $name    = $args[0] ?? null;
+    $dataDir = getDataDirFromArgs($args);
+
+    if ($name === null) {
+        printError('BUCKIE_INVALID_ARGS', 'Usage: buckie remove bucket <name>');
+    }
+
+    $services = bootstrapServices($dataDir);
+    try {
+        $services['bucketService']->delete($name);
+        printJson(['ok' => true, 'data' => ['removed' => $name]]);
+    } catch (\Throwable $e) {
+        printThrowable($e);
+    }
+}
+
+// ── remove identity ───────────────────────────────────────────────────────────
+
+function cmdRemoveIdentity(array $args): void
+{
+    $identity = $args[0] ?? null;
+    $dataDir  = getDataDirFromArgs($args);
+
+    if ($identity === null) {
+        printError('BUCKIE_INVALID_ARGS', 'Usage: buckie remove identity <identity>');
+    }
+
+    $services = bootstrapServices($dataDir);
+    try {
+        $services['identityService']->delete($identity);
+        printJson(['ok' => true, 'data' => ['removed' => $identity]]);
+    } catch (\Throwable $e) {
+        printThrowable($e);
+    }
+}
+
+// ── grant ─────────────────────────────────────────────────────────────────────
+
+function cmdGrant(array $args): void
+{
+    $identity = $args[0] ?? null;
+    $bucket   = $args[1] ?? null;
+    $dataDir  = getDataDirFromArgs($args);
+
+    if ($identity === null || $bucket === null) {
+        printError('BUCKIE_INVALID_ARGS', 'Usage: buckie grant <identity> <bucket> --read --write --delete [--prefix <path>]');
+    }
+
+    $permissions = [];
+    if (getFlag($args, '--read'))   $permissions[] = 'read';
+    if (getFlag($args, '--write'))  $permissions[] = 'write';
+    if (getFlag($args, '--delete')) $permissions[] = 'delete';
+
+    if (empty($permissions)) {
+        printError('BUCKIE_INVALID_ARGS', 'At least one permission (--read, --write, --delete) must be specified');
+    }
+
+    $prefixes = getMultiOption($args, '--prefix');
+
+    $services = bootstrapServices($dataDir);
+    try {
+        $id     = $services['identityService']->grant($identity, [
+            'bucket'      => $bucket,
+            'prefixes'    => $prefixes,
+            'permissions' => $permissions,
+        ]);
+        $safeId = array_merge($id, ['hashedSecret' => '[REDACTED]']);
+        printJson(['ok' => true, 'data' => $safeId]);
+    } catch (\Throwable $e) {
+        printThrowable($e);
+    }
+}
+
+// ── revoke ────────────────────────────────────────────────────────────────────
+
+function cmdRevoke(array $args): void
+{
+    $identity = $args[0] ?? null;
+    $bucket   = $args[1] ?? null;
+    $dataDir  = getDataDirFromArgs($args);
+
+    if ($identity === null || $bucket === null) {
+        printError('BUCKIE_INVALID_ARGS', 'Usage: buckie revoke <identity> <bucket>');
+    }
+
+    $services = bootstrapServices($dataDir);
+    try {
+        $id     = $services['identityService']->revoke($identity, $bucket);
+        $safeId = array_merge($id, ['hashedSecret' => '[REDACTED]']);
+        printJson(['ok' => true, 'data' => $safeId]);
+    } catch (\Throwable $e) {
+        printThrowable($e);
+    }
+}
+
+// ── upload ────────────────────────────────────────────────────────────────────
+
+function cmdUpload(array $args): void
+{
+    $bucketName = $args[0] ?? null;
+    $key        = $args[1] ?? null;
+    $localFile  = $args[2] ?? null;
+    $dataDir    = getDataDirFromArgs($args);
+
+    if ($bucketName === null || $key === null || $localFile === null) {
+        printError('BUCKIE_INVALID_ARGS', 'Usage: buckie upload <bucket> <key> <localFile>');
+    }
+
+    if (!file_exists($localFile)) {
+        printError('BUCKIE_NOT_FOUND', "Local file not found: {$localFile}");
+    }
+
+    $services = bootstrapServices($dataDir);
+    try {
+        $bucket  = $services['bucketService']->get($bucketName);
+        $storage = getStorageService($services);
+        $stream  = fopen($localFile, 'rb');
+
+        if ($stream === false) {
+            printError('BUCKIE_ERROR', "Cannot open file: {$localFile}");
+        }
+
+        $result = $storage->upload($bucket, $key, $stream);
+        fclose($stream);
+
+        printJson(['ok' => true, 'data' => ['bucket' => $bucketName, 'key' => $key, ...$result]]);
+    } catch (\Throwable $e) {
+        printThrowable($e);
+    }
+}
+
+// ── copy ──────────────────────────────────────────────────────────────────────
+
+function cmdCopy(array $args): void
+{
+    $srcBucket = $args[0] ?? null;
+    $srcKey    = $args[1] ?? null;
+    $dstBucket = $args[2] ?? null;
+    $dstKey    = $args[3] ?? null;
+    $dataDir   = getDataDirFromArgs($args);
+
+    if ($srcBucket === null || $srcKey === null || $dstBucket === null || $dstKey === null) {
+        printError('BUCKIE_INVALID_ARGS', 'Usage: buckie copy <srcBucket> <srcKey> <dstBucket> <dstKey>');
+    }
+
+    $services = bootstrapServices($dataDir);
+    try {
+        $src     = $services['bucketService']->get($srcBucket);
+        $dst     = $services['bucketService']->get($dstBucket);
+        $storage = getStorageService($services);
+
+        $srcInfo = $storage->getFileInfo($src, $srcKey);
+        $stream  = fopen($srcInfo['path'], 'rb');
+
+        if ($stream === false) {
+            printError('BUCKIE_ERROR', "Cannot open source file: {$srcInfo['path']}");
+        }
+
+        $result = $storage->upload($dst, $dstKey, $stream);
+        fclose($stream);
+
+        printJson(['ok' => true, 'data' => [
+            'from' => "{$srcBucket}/{$srcKey}",
+            'to'   => "{$dstBucket}/{$dstKey}",
+            ...$result,
+        ]]);
+    } catch (\Throwable $e) {
+        printThrowable($e);
+    }
+}
+
+// ── provision ─────────────────────────────────────────────────────────────────
+
+function cmdProvision(array $args): void
+{
+    $bucketName = $args[0] ?? null;
+    $dataDir    = getDataDirFromArgs($args);
+
+    if ($bucketName === null) {
+        printError('BUCKIE_INVALID_ARGS', 'Usage: buckie provision <bucket> [--identity <name>] [--prefix <path>] [--read] [--write] [--delete]');
+    }
+
+    $identity = getOption($args, '--identity') ?? 'buckie-' . bin2hex(random_bytes(4));
+    $secret   = base64_encode(random_bytes(24));
+    // Make it URL-safe (similar to Node's base64url)
+    $secret   = strtr($secret, '+/', '-_');
+
+    $permissions = [];
+    if (getFlag($args, '--read'))   $permissions[] = 'read';
+    if (getFlag($args, '--write'))  $permissions[] = 'write';
+    if (getFlag($args, '--delete')) $permissions[] = 'delete';
+    if (empty($permissions))        $permissions   = ['read', 'write', 'delete'];
+
+    $prefixes = getMultiOption($args, '--prefix');
+
+    $services = bootstrapServices($dataDir);
+    try {
+        // Ensure bucket exists
+        $services['bucketService']->get($bucketName);
+
+        $services['identityService']->create($identity, $secret);
+        $services['identityService']->grant($identity, [
+            'bucket'      => $bucketName,
+            'prefixes'    => $prefixes,
+            'permissions' => $permissions,
+        ]);
+
+        printJson(['ok' => true, 'data' => [
+            'identity'    => $identity,
+            'secret'      => $secret,
+            'bucket'      => $bucketName,
+            'permissions' => $permissions,
+            'prefixes'    => $prefixes,
+            'note'        => 'Save the secret now — it will not be shown again.',
+        ]]);
+    } catch (\Throwable $e) {
+        printThrowable($e);
+    }
+}
+
+// ── completion ────────────────────────────────────────────────────────────────
+
+function cmdCompletion(array $args): void
+{
+    $shell = $args[0] ?? null;
+
+    if ($shell === null) {
+        printError('BUCKIE_INVALID_ARGS', 'Usage: buckie completion <bash|zsh|fish>');
+    }
+
+    match (strtolower($shell)) {
+        'bash'  => print(bashCompletion()),
+        'zsh'   => print(zshCompletion()),
+        'fish'  => print(fishCompletion()),
+        default => printError('BUCKIE_INVALID_ARGS', "Unsupported shell '{$shell}'. Use: bash | zsh | fish"),
+    };
+}
+
+// ── Usage / help ──────────────────────────────────────────────────────────────
+
+function printUsage(): void
+{
+    echo <<<'HELP'
+Buckie — filesystem-native file server with a minimal S3-style REST API
+
+Usage:
+  buckie <command> [options]
+
+Commands:
+  serve                 Start the development server (PHP built-in server)
+  create bucket         Create a new bucket
+  create identity       Create a new identity
+  list buckets          List all buckets
+  list identities       List all identities
+  list files            List files in a bucket or directory
+  remove bucket         Remove a bucket definition
+  remove identity       Remove an identity
+  grant                 Grant permissions to an identity on a bucket
+  revoke                Revoke all permissions from an identity on a bucket
+  upload                Upload a local file to a bucket
+  copy                  Copy a file between buckets
+  provision             Auto-generate identity + secret + grant in one step
+  completion            Print shell tab-completion script
+
+Options (most commands):
+  --data-dir <dir>      Data directory (default: .buckie or $BUCKIE_DATA_DIR)
+
+Examples:
+  buckie create bucket documents /mnt/storage/documents
+  buckie create identity erp-prod my-secret
+  buckie grant erp-prod documents --read --write --delete --prefix /tenant-a/
+  buckie serve --port 8080
+  buckie provision documents --read --write
+
+HELP;
+}
+
+// ── Server summary ────────────────────────────────────────────────────────────
+
+function printServerSummary(string $dataDir): void
+{
+    try {
+        $bucketService   = new BucketService($dataDir);
+        $identityService = new IdentityService($dataDir);
+
+        $buckets    = $bucketService->list();
+        $identities = $identityService->list();
+
+        $bucketLines = array_map(
+            fn($b) => "│    · {$b['name']}  →  {$b['path']}",
+            $buckets
+        ) ?: ['│    (none)'];
+
+        $identityLines = array_map(
+            fn($id) => '│    · ' . $id['identity'] . '  (grants: ' . implode(', ', array_column($id['grants'], 'bucket')) . ')',
+            $identities
+        ) ?: ['│    (none)'];
+
+        echo implode("\n", [
+            '┌─────────────────────────────────────────────',
+            '│  Buckets',
+            '├─────────────────────────────────────────────',
+            ...$bucketLines,
+            '├─────────────────────────────────────────────',
+            '│  Identities',
+            '├─────────────────────────────────────────────',
+            ...$identityLines,
+            '└─────────────────────────────────────────────',
+        ]) . "\n";
+    } catch (\Throwable) {
+        // Non-fatal
+    }
+}
+
+function printEnvInfo(): void
+{
+    $os = php_uname();
+    echo implode("\n", [
+        'Buckie — Environment',
+        '─────────────────────────────────────────────',
+        '  PHP         : ' . PHP_VERSION,
+        '  OS          : ' . $os,
+        '  PID         : ' . getmypid(),
+    ]) . "\n";
+}
+
+// ── Shell completions ─────────────────────────────────────────────────────────
+
+function bashCompletion(): string
+{
+    return <<<'BASH'
+_buckie_completion() {
+    local cur prev words cword
+    _init_completion || return
+
+    local commands="serve create list remove grant revoke upload copy provision completion"
+    local create_subs="bucket identity"
+    local list_subs="buckets identities files"
+    local remove_subs="bucket identity"
+
+    case "$prev" in
+        buckie) COMPREPLY=($(compgen -W "$commands" -- "$cur")) ;;
+        create) COMPREPLY=($(compgen -W "$create_subs" -- "$cur")) ;;
+        list)   COMPREPLY=($(compgen -W "$list_subs"   -- "$cur")) ;;
+        remove) COMPREPLY=($(compgen -W "$remove_subs" -- "$cur")) ;;
+        completion) COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur")) ;;
+        --data-dir) COMPREPLY=($(compgen -d -- "$cur")) ;;
+        *)
+            local opts="--data-dir --read --write --delete --prefix --host --port --identity --limit --cursor"
+            COMPREPLY=($(compgen -W "$opts" -- "$cur"))
+            ;;
+    esac
+}
+
+complete -F _buckie_completion buckie
+BASH;
+}
+
+function zshCompletion(): string
+{
+    return <<<'ZSH'
+#compdef buckie
+
+_buckie() {
+    local -a commands
+    commands=(
+        'serve:Start the development server'
+        'create:Create a resource (bucket|identity)'
+        'list:List resources (buckets|identities|files)'
+        'remove:Remove a resource (bucket|identity)'
+        'grant:Grant permissions to an identity'
+        'revoke:Revoke permissions from an identity'
+        'upload:Upload a local file to a bucket'
+        'copy:Copy a file between buckets'
+        'provision:Auto-generate identity + secret + grant'
+        'completion:Print shell completion script'
+    )
+
+    case "$words[2]" in
+        create)
+            local -a subs
+            subs=('bucket:Create a bucket' 'identity:Create an identity')
+            _describe 'subcommand' subs ;;
+        list)
+            local -a subs
+            subs=('buckets:List buckets' 'identities:List identities' 'files:List files')
+            _describe 'subcommand' subs ;;
+        remove)
+            local -a subs
+            subs=('bucket:Remove a bucket' 'identity:Remove an identity')
+            _describe 'subcommand' subs ;;
+        completion)
+            _values 'shell' bash zsh fish ;;
+        *)
+            _describe 'command' commands ;;
+    esac
+}
+
+_buckie "$@"
+ZSH;
+}
+
+function fishCompletion(): string
+{
+    return <<<'FISH'
+complete -c buckie -f -n '__fish_use_subcommand' -a serve       -d 'Start the development server'
+complete -c buckie -f -n '__fish_use_subcommand' -a create      -d 'Create a resource'
+complete -c buckie -f -n '__fish_use_subcommand' -a list        -d 'List resources'
+complete -c buckie -f -n '__fish_use_subcommand' -a remove      -d 'Remove a resource'
+complete -c buckie -f -n '__fish_use_subcommand' -a grant       -d 'Grant permissions'
+complete -c buckie -f -n '__fish_use_subcommand' -a revoke      -d 'Revoke permissions'
+complete -c buckie -f -n '__fish_use_subcommand' -a upload      -d 'Upload a file'
+complete -c buckie -f -n '__fish_use_subcommand' -a copy        -d 'Copy a file between buckets'
+complete -c buckie -f -n '__fish_use_subcommand' -a provision   -d 'Auto-provision identity + grant'
+complete -c buckie -f -n '__fish_use_subcommand' -a completion  -d 'Print shell completion'
+
+complete -c buckie -l data-dir  -d 'Data directory'
+complete -c buckie -l host      -d 'Server host'
+complete -c buckie -l port      -d 'Server port'
+complete -c buckie -l read      -d 'Grant read'
+complete -c buckie -l write     -d 'Grant write'
+complete -c buckie -l delete    -d 'Grant delete'
+complete -c buckie -l prefix    -d 'Path prefix'
+complete -c buckie -l identity  -d 'Identity name'
+complete -c buckie -l limit     -d 'Max results'
+complete -c buckie -l cursor    -d 'Pagination cursor'
+FISH;
+}
+

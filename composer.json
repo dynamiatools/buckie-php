@@ -1,0 +1,32 @@
+{
+  "name": "dynamia-tools/buckie",
+  "description": "Buckie PHP — filesystem-native file server with a minimal S3-style REST API",
+  "type": "project",
+  "license": "MIT",
+  "require": {
+    "php": ">=8.0"
+  },
+  "autoload": {
+    "psr-4": {
+      "Buckie\\": "src/"
+    }
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "Buckie\\Tests\\": "tests/"
+    }
+  },
+  "scripts": {
+    "test": "phpunit"
+  },
+  "bin": [
+    "bin/buckie"
+  ],
+  "config": {
+    "optimize-autoloader": true,
+    "sort-packages": true
+  },
+  "require-dev": {
+    "phpunit/phpunit": "^11"
+  }
+}

@@ -1,0 +1,22 @@
+Options -Indexes
+
+# Rewrite everything to index.php
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteBase /
+
+    # Block any request targeting the internal .buckie directory — return 404
+    RewriteRule ^\.buckie(/|$) - [R=404,L]
+
+    # Do not rewrite requests to existing files (shouldn't exist here)
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteCond %{REQUEST_FILENAME} !-d
+
+    RewriteRule ^(.*)$ index.php [QSA,L]
+</IfModule>
+
+# Pass Authorization header to PHP (needed for Basic Auth on some Apache configs)
+<IfModule mod_setenvif.c>
+    SetEnvIf Authorization "(.*)" HTTP_AUTHORIZATION=$1
+</IfModule>
+

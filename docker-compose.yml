@@ -1,0 +1,28 @@
+services:
+
+  buckie:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: buckie-php
+    ports:
+      - "8080:80"
+    environment:
+      # Directory where Buckie stores config.json, logs and cache
+      BUCKIE_DATA_DIR: /var/buckie-data
+      # Base storage directory (mount your own path here)
+      BUCKIE_STORAGE_DIR: /var/buckie-storage
+      BUCKIE_LOG_LEVEL: debug
+    volumes:
+      # Persist Buckie config, logs and cache between restarts
+      - ./docker-data/buckie:/var/buckie-data
+      # Local storage for uploaded files
+      - ./docker-data/storage:/var/buckie-storage
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
