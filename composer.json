@@ -1,6 +1,6 @@
 {
   "name": "dynamia-tools/buckie",
-  "description": "Buckie PHP — filesystem-native file server with a minimal S3-style REST API",
+  "description": "Buckie PHP — filesystem-native file server with a minimal S3-style REST API. Standalone application.",
   "type": "project",
   "license": "MIT",
   "require": {
@@ -22,6 +22,8 @@
   "bin": [
     "bin/buckie"
   ],
+  "minimum-stability": "stable",
+  "prefer-stable": true,
   "config": {
     "optimize-autoloader": true,
     "sort-packages": true

@@ -4,6 +4,18 @@ PHP 8+ implementation of Buckie — a filesystem-native file server with a minim
 
 Designed for **shared hosting and standard PHP environments**: no framework, no database, no message broker. Just PHP and a disk.
 
+> **Standalone application** — Buckie PHP runs as a self-contained CLI tool and/or HTTP server. It is **not** a reusable library to be required inside another project.
+
+---
+
+## Usage modes
+
+| Mode | How | Description |
+|---|---|---|
+| **CLI** | `php bin/buckie <command>` | Manage buckets, identities, files and permissions from the terminal |
+| **HTTP server (dev)** | `php bin/buckie serve` | Starts PHP's built-in server — useful for local development |
+| **HTTP server (prod)** | Apache / Nginx / FrankenPHP | Deploy `public/index.php` under any standard PHP web server |
+
 ---
 
 ## Features
@@ -33,21 +45,38 @@ Designed for **shared hosting and standard PHP environments**: no framework, no 
 
 ## Installation
 
+### Option A — create-project (recommended)
+
 ```bash
+composer create-project dynamia-tools/buckie buckie-php
+cd buckie-php
+```
+
+This installs Buckie as a standalone application in the `buckie-php/` directory.
+
+### Option B — clone + install
+
+```bash
+git clone https://github.com/dynamia-tools/buckie buckie-php
+cd buckie-php/buckie-php
 composer install
 ```
 
-To install the CLI globally:
+### Make the CLI available globally
 
 ```bash
 # Link the binary to a directory in your $PATH
-ln -s /path/to/buckie-php/bin/buckie ~/.local/bin/buckie
+ln -s "$(pwd)/bin/buckie" ~/.local/bin/buckie
 chmod +x ~/.local/bin/buckie
 ```
 
 ---
 
 ## Quick Start
+
+### As a CLI tool
+
+All management operations (buckets, identities, permissions, files) are handled through the `buckie` CLI:
 
 ```bash
 # Create a bucket
@@ -59,9 +88,24 @@ php bin/buckie create identity erp-prod my-secret-password
 # Grant permissions
 php bin/buckie grant erp-prod documents --read --write --delete --prefix /tenant-a/
 
-# Start the development server
+# List all buckets
+php bin/buckie list buckets
+
+# Upload a file directly from the terminal
+php bin/buckie upload documents tenant-a/invoice.pdf ./invoice.pdf
+```
+
+Run `php bin/buckie --help` to see all available commands.
+
+### As an HTTP server (development)
+
+```bash
 php bin/buckie serve --host 0.0.0.0 --port 8080
 ```
+
+### As an HTTP server (production)
+
+Deploy the `public/` directory under Apache, Nginx or FrankenPHP (see [Production Deployment](#production-deployment) below).
 
 ---
 
