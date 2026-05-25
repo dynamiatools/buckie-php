@@ -1,3 +1,8 @@
+![Packagist Version](https://img.shields.io/packagist/v/dynamia-tools/buckie)
+![Packagist Downloads](https://img.shields.io/packagist/dt/dynamia-tools/buckie)
+![PHP Version](https://img.shields.io/packagist/php-v/dynamia-tools/buckie)
+![License](https://img.shields.io/packagist/l/dynamia-tools/buckie)
+
 # Buckie PHP
 
 PHP 8+ implementation of Buckie — a filesystem-native file server with a minimal S3-style REST API.
