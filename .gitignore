@@ -1,0 +1,30 @@
+# Composer dependencies
+/vendor/
+
+# Buckie runtime data directory
+.buckie/
+
+# Docker persistent data
+docker-data/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# PHP cache / opcache
+*.cache
+
