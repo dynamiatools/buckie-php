@@ -44,7 +44,7 @@ class LocalStorageService
 
     /**
      * Returns metadata needed to stream a file.
-     * Caller is responsible for sending headers and calling streamFile().
+     * Caller is responsible for sending headers and streaming the file.
      */
     public function getFileInfo(array $bucket, string $key): array
     {
@@ -71,66 +71,95 @@ class LocalStorageService
         ];
     }
 
-    /**
-     * Stream a local file to the current output buffer.
-     */
-    public function streamFile(string $filePath): void
-    {
-        $fp = fopen($filePath, 'rb');
-        if ($fp === false) {
-            throw BuckieException::notFound("Cannot open file for streaming");
-        }
-        fpassthru($fp);
-        fclose($fp);
-    }
-
     // ── Upload ────────────────────────────────────────────────────────────────
 
     /**
      * Write the request body to a staging file, then atomically rename to final path.
-     * Returns ['size' => int, 'etag' => string].
+     *
+     * @param int      $maxBytes      Maximum accepted size; 0 disables the limit.
+     * @param int|null $contentLength Declared size; the upload is rejected if the body differs.
+     * @return array{size: int, etag: string}
      */
-    public function upload(array $bucket, string $key, $inputStream, bool $overwrite = true): array
-    {
-        $finalPath  = $this->bucketService->resolveKey($bucket, $key);
-        $stagingDir = $this->bucketService->getStagingDir($bucket);
-        $stagingFile = $stagingDir . '/' . bin2hex(random_bytes(8)) . '.tmp';
+    public function upload(
+        array $bucket,
+        string $key,
+        $inputStream,
+        bool $overwrite = true,
+        int $maxBytes = 0,
+        ?int $contentLength = null,
+    ): array {
+        $finalPath = $this->bucketService->resolveKey($bucket, $key);
 
-        // Ensure parent directory exists
-        $parentDir = dirname($finalPath);
-        if (!is_dir($parentDir)) {
-            mkdir($parentDir, 0755, true);
+        if ($maxBytes > 0 && $contentLength !== null && $contentLength > $maxBytes) {
+            throw BuckieException::payloadTooLarge($maxBytes);
+        }
+        if (is_dir($finalPath)) {
+            throw BuckieException::badRequest("'{$key}' is a directory", 'BUCKIE_OBJECT_IS_DIRECTORY');
+        }
+        if (!$overwrite && file_exists($finalPath)) {
+            throw BuckieException::conflict("Object '{$key}' already exists", 'BUCKIE_OBJECT_ALREADY_EXISTS');
         }
 
-        // Write to staging
+        $this->bucketService->ensureBucketInternals($bucket['path']);
+        $stagingFile = $this->bucketService->getStagingDir($bucket) . '/' . bin2hex(random_bytes(8)) . '.tmp';
+
+        // Ensure parent directory exists (resolveKey already proved it stays inside the bucket)
+        $parentDir = dirname($finalPath);
+        if (!is_dir($parentDir) && !mkdir($parentDir, 0755, true) && !is_dir($parentDir)) {
+            throw new \RuntimeException("Cannot create directory for '{$key}'");
+        }
+
         $out = fopen($stagingFile, 'wb');
         if ($out === false) {
-            throw new \RuntimeException("Cannot open staging file for writing: {$stagingFile}");
+            throw new \RuntimeException('Cannot open staging file for writing');
         }
 
         $bytesWritten = 0;
         try {
             while (!feof($inputStream)) {
-                $chunk        = fread($inputStream, 65536);
+                $chunk = fread($inputStream, 65536);
                 if ($chunk === false) {
-                    break;
+                    throw new \RuntimeException('Failed to read the request body');
                 }
-                $written      = fwrite($out, $chunk);
-                $bytesWritten += $written;
+                if ($chunk === '') {
+                    continue;
+                }
+
+                $bytesWritten += strlen($chunk);
+                if ($maxBytes > 0 && $bytesWritten > $maxBytes) {
+                    throw BuckieException::payloadTooLarge($maxBytes);
+                }
+
+                // fwrite may write fewer bytes than requested (disk full); treat as failure
+                if (fwrite($out, $chunk) !== strlen($chunk)) {
+                    throw new \RuntimeException('Failed to write upload to disk (disk full?)');
+                }
             }
-        } finally {
+
+            if ($contentLength !== null && $contentLength !== $bytesWritten) {
+                throw BuckieException::badRequest(
+                    "Body size ({$bytesWritten}) does not match Content-Length ({$contentLength})",
+                    'BUCKIE_UPLOAD_INCOMPLETE'
+                );
+            }
+        } catch (\Throwable $e) {
             fclose($out);
+            @unlink($stagingFile);
+            throw $e;
         }
+        fclose($out);
 
         // Atomic move to final destination
         if (!rename($stagingFile, $finalPath)) {
             @unlink($stagingFile);
-            throw new \RuntimeException("Failed to commit upload to '{$finalPath}'");
+            throw new \RuntimeException('Failed to commit upload');
         }
 
-        $etag = '"' . $bytesWritten . '-' . time() . '"';
+        // Same ETag formula as getFileInfo(), so uploads and reads agree
+        clearstatcache(true, $finalPath);
+        $stat = stat($finalPath);
 
-        return ['size' => $bytesWritten, 'etag' => $etag];
+        return ['size' => $bytesWritten, 'etag' => '"' . $stat['size'] . '-' . $stat['mtime'] . '"'];
     }
 
     // ── Delete ────────────────────────────────────────────────────────────────
@@ -280,6 +309,20 @@ class LocalStorageService
         }
 
         return $this->mimeFromExtension($filePath);
+    }
+
+    /** Content a browser could execute if served inline from the API origin. */
+    public static function isActiveContent(string $mimeType): bool
+    {
+        return in_array($mimeType, [
+            'text/html',
+            'application/xhtml+xml',
+            'image/svg+xml',
+            'text/javascript',
+            'application/javascript',
+            'application/xml',
+            'text/xml',
+        ], true);
     }
 
     public function isImage(string $mimeType): bool

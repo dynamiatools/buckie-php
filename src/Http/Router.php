@@ -27,7 +27,11 @@ class Router
         $this->identityService  = new IdentityService($dataDir);
         $this->bucketService    = new BucketService($dataDir);
         $this->storageService   = new LocalStorageService($this->bucketService);
-        $this->thumbnailService = new ThumbnailService($this->bucketService, $this->storageService);
+        $this->thumbnailService = new ThumbnailService(
+            $this->bucketService,
+            $this->storageService,
+            ConfigService::getCacheDir($dataDir),
+        );
         $this->logger           = new OperationalLogger($dataDir);
     }
 
@@ -60,9 +64,11 @@ class Router
             }
 
             $start = microtime(true);
-            $ip    = $_SERVER['HTTP_X_FORWARDED_FOR']
-                  ?? $_SERVER['REMOTE_ADDR']
-                  ?? 'unknown';
+            // X-Forwarded-For is client-controlled; only honor it when a trusted proxy is configured.
+            $ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+            if (getenv('BUCKIE_TRUST_PROXY') === '1' && isset($_SERVER['HTTP_X_FORWARDED_FOR'])) {
+                $ip = trim(explode(',', $_SERVER['HTTP_X_FORWARDED_FOR'])[0]);
+            }
 
             match ($method) {
                 'GET'    => $this->handleGet($identity, $bucketName, $key, $start, $ip),
@@ -87,17 +93,18 @@ class Router
 
     private function handleGet(array $identity, string $bucketName, string $key, float $start, string $ip): void
     {
+        // Check permission first so unauthorized identities cannot tell which buckets exist
+        $this->checkPermission($identity, $bucketName, $key === '' ? '/' : $key, 'read');
         $bucket = $this->bucketService->get($bucketName);
 
         // Bucket listing (no key or key is exactly empty → GET /:bucket?limit=&cursor=&filter=)
         if ($key === '') {
-            $this->checkPermission($identity, $bucketName, '/', 'read');
 
             $limit  = (int) ($_GET['limit']  ?? 100);
             $limit  = min(max($limit, 1), 1000);
-            $cursor = $_GET['cursor'] ?? null;
+            $cursor = isset($_GET['cursor']) && is_string($_GET['cursor']) ? $_GET['cursor'] : null;
             $filter = $_GET['filter'] ?? 'all';
-            if (!in_array($filter, ['files', 'dirs'], true)) {
+            if (!is_string($filter) || !in_array($filter, ['files', 'dirs'], true)) {
                 $filter = 'all';
             }
 
@@ -118,10 +125,8 @@ class Router
 
         // Directory listing
         if (str_ends_with($key, '/')) {
-            $this->checkPermission($identity, $bucketName, $key, 'read');
-
             $filter = $_GET['filter'] ?? 'all';
-            if (!in_array($filter, ['files', 'dirs'], true)) {
+            if (!is_string($filter) || !in_array($filter, ['files', 'dirs'], true)) {
                 $filter = 'all';
             }
 
@@ -141,15 +146,13 @@ class Router
             return;
         }
 
-        $this->checkPermission($identity, $bucketName, $key, 'read');
-
-        // Thumbnail request
-        $w      = isset($_GET['w']) ? (int) $_GET['w'] : 0;
-        $h      = isset($_GET['h']) ? (int) $_GET['h'] : 0;
-        $fit    = $_GET['fit']    ?? 'cover';
-        $format = $_GET['format'] ?? 'webp';
+        // Thumbnail request (all parameters are validated; invalid values yield 400)
+        $w      = ThumbnailService::validateDimension(self::intParam('w'), 'w');
+        $h      = ThumbnailService::validateDimension(self::intParam('h'), 'h');
 
         if ($w > 0 || $h > 0) {
+            $fit       = ThumbnailService::normalizeFit(self::stringParam('fit', 'cover'));
+            $format    = ThumbnailService::normalizeFormat(self::stringParam('format', 'webp'));
             $thumbPath = $this->thumbnailService->getThumbnailPath($bucket, $key, $w, $h, $fit, $format);
 
             if ($thumbPath !== null) {
@@ -158,7 +161,8 @@ class Router
 
                 $this->emitHeader('Content-Type', $mimeType);
                 $this->emitHeader('Content-Length', (string) $size);
-                $this->emitHeader('Cache-Control', 'public, max-age=86400');
+                $this->emitHeader('Cache-Control', 'private, max-age=86400');
+                $this->emitHeader('X-Content-Type-Options', 'nosniff');
 
                 $this->logger->log([
                     'event'     => 'download',
@@ -179,11 +183,7 @@ class Router
         // Regular file download
         $info = $this->storageService->getFileInfo($bucket, $key);
 
-        $this->emitHeader('Content-Type', $info['mimeType']);
-        $this->emitHeader('Content-Length', (string) $info['size']);
-        $this->emitHeader('ETag', $info['etag']);
-        $this->emitHeader('Last-Modified', $info['lastModified']);
-        $this->emitHeader('Cache-Control', 'private, max-age=0');
+        $this->emitDownloadHeaders($info);
 
         $this->logger->log([
             'event'     => 'download',
@@ -211,11 +211,7 @@ class Router
         $info = $this->storageService->getFileInfo($bucket, $key);
 
         $this->setStatusCode(200);
-        $this->emitHeader('Content-Type', $info['mimeType']);
-        $this->emitHeader('Content-Length', (string) $info['size']);
-        $this->emitHeader('ETag', $info['etag']);
-        $this->emitHeader('Last-Modified', $info['lastModified']);
-        $this->emitHeader('Cache-Control', 'private, max-age=0');
+        $this->emitDownloadHeaders($info);
 
         $this->logger->log([
             'event'     => 'head',
@@ -252,7 +248,14 @@ class Router
         }
 
         try {
-            $result = $this->storageService->upload($bucket, $key, $inputStream);
+            $result = $this->storageService->upload(
+                $bucket,
+                $key,
+                $inputStream,
+                true,
+                ConfigService::getMaxUploadBytes(),
+                isset($_SERVER['CONTENT_LENGTH']) ? (int) $_SERVER['CONTENT_LENGTH'] : null,
+            );
         } finally {
             fclose($inputStream);
         }
@@ -380,11 +383,49 @@ class Router
         header("{$name}: {$value}");
     }
 
+    /** Headers for file downloads; active content is forced to download and never sniffed. */
+    private function emitDownloadHeaders(array $info): void
+    {
+        $mime = $info['mimeType'];
+        $this->emitHeader('Content-Type', $mime);
+        $this->emitHeader('Content-Length', (string) $info['size']);
+        $this->emitHeader('ETag', $info['etag']);
+        $this->emitHeader('Last-Modified', $info['lastModified']);
+        $this->emitHeader('Cache-Control', 'private, max-age=0');
+        $this->emitHeader('X-Content-Type-Options', 'nosniff');
+        $this->emitHeader('Content-Security-Policy', "default-src 'none'; sandbox");
+
+        if (LocalStorageService::isActiveContent($mime)) {
+            $this->emitHeader('Content-Disposition', 'attachment');
+        }
+    }
+
+    private static function intParam(string $name): int
+    {
+        if (!isset($_GET[$name])) {
+            return 0;
+        }
+        $raw = $_GET[$name];
+        if (!is_string($raw) || !preg_match('/^\d{1,9}$/', $raw)) {
+            throw BuckieException::badRequest("Invalid '{$name}' parameter", 'BUCKIE_THUMBNAIL_PARAM_INVALID');
+        }
+        return (int) $raw;
+    }
+
+    private static function stringParam(string $name, string $default): string
+    {
+        $raw = $_GET[$name] ?? $default;
+        if (!is_string($raw)) {
+            throw BuckieException::badRequest("Invalid '{$name}' parameter", 'BUCKIE_THUMBNAIL_PARAM_INVALID');
+        }
+        return $raw;
+    }
+
     private function streamFile(string $path): void
     {
         $fp = fopen($path, 'rb');
         if ($fp === false) {
-            throw BuckieException::notFound("Cannot stream file: {$path}");
+            throw BuckieException::notFound('Cannot stream file');
         }
         fpassthru($fp);
         fclose($fp);

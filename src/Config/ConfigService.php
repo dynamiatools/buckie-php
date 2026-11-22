@@ -6,15 +6,20 @@ namespace Buckie\Config;
 
 class ConfigService
 {
+    public const VERSION = '1.0.0';
+
     private const DEFAULT_PORT     = 8080;
     private const DEFAULT_HOST     = '0.0.0.0';
     private const DEFAULT_LOG_LEVEL = 'info';
+    private const DEFAULT_MAX_UPLOAD_BYTES = 536_870_912; // 512 MiB, matches the Docker PHP limits
 
     // ── Data directory resolution ─────────────────────────────────────────────
 
     public static function getDataDir(): string
     {
-        return getenv('BUCKIE_DATA_DIR') ?: (getcwd() . '/.buckie');
+        // Never derive the default from the current working directory: under
+        // FPM/FrankenPHP the cwd is often the webroot, which would expose config.json.
+        return getenv('BUCKIE_DATA_DIR') ?: (dirname(__DIR__, 2) . '/.buckie');
     }
 
     public static function getHost(): string
@@ -26,6 +31,13 @@ class ConfigService
     {
         $env = getenv('BUCKIE_PORT');
         return $env !== false ? (int) $env : self::DEFAULT_PORT;
+    }
+
+    /** Maximum accepted upload size in bytes (BUCKIE_MAX_UPLOAD_BYTES); 0 means unlimited. */
+    public static function getMaxUploadBytes(): int
+    {
+        $env = getenv('BUCKIE_MAX_UPLOAD_BYTES');
+        return ($env !== false && ctype_digit($env)) ? (int) $env : self::DEFAULT_MAX_UPLOAD_BYTES;
     }
 
     public static function getLogLevel(): string
@@ -60,13 +72,19 @@ class ConfigService
             self::getCacheDir($dataDir),
         ] as $dir) {
             if (!is_dir($dir)) {
-                mkdir($dir, 0755, true);
+                if (!mkdir($dir, 0700, true) && !is_dir($dir)) {
+                    throw new \RuntimeException("Cannot create directory: {$dir}");
+                }
             }
         }
     }
 
     // ── Config read / write ───────────────────────────────────────────────────
 
+    /**
+     * Read the config. A missing file yields an empty config; a corrupt file
+     * throws so that callers never overwrite existing data with an empty config.
+     */
     public static function readConfig(string $dataDir): array
     {
         $file = self::getConfigFile($dataDir);
@@ -77,12 +95,12 @@ class ConfigService
 
         $raw = file_get_contents($file);
         if ($raw === false) {
-            return ['buckets' => [], 'identities' => []];
+            throw new \RuntimeException("Cannot read config file: {$file}");
         }
 
         $parsed = json_decode($raw, true);
         if (!is_array($parsed)) {
-            return ['buckets' => [], 'identities' => []];
+            throw new \RuntimeException("Config file is not valid JSON: {$file}");
         }
 
         return [
@@ -93,8 +111,8 @@ class ConfigService
 
     public static function writeConfig(string $dataDir, array $config): void
     {
-        if (!is_dir($dataDir)) {
-            mkdir($dataDir, 0755, true);
+        if (!is_dir($dataDir) && !mkdir($dataDir, 0700, true) && !is_dir($dataDir)) {
+            throw new \RuntimeException("Cannot create data directory: {$dataDir}");
         }
 
         $file = self::getConfigFile($dataDir);
@@ -104,10 +122,57 @@ class ConfigService
             throw new \RuntimeException('Failed to encode config as JSON');
         }
 
-        // Atomic write via temp file + rename
+        // Atomic write via temp file + rename (temp file is 0600 and cleaned up on failure)
         $tmp = $file . '.tmp.' . bin2hex(random_bytes(4));
-        file_put_contents($tmp, $json);
-        rename($tmp, $file);
+        $fp  = @fopen($tmp, 'xb');
+        if ($fp === false) {
+            throw new \RuntimeException("Cannot create temp config file: {$tmp}");
+        }
+        @chmod($tmp, 0600);
+
+        $ok = fwrite($fp, $json) === strlen($json);
+        $ok = fclose($fp) && $ok;
+
+        if (!$ok || !rename($tmp, $file)) {
+            @unlink($tmp);
+            throw new \RuntimeException("Failed to write config file: {$file}");
+        }
+    }
+
+    /**
+     * Read-modify-write the config under an exclusive lock so concurrent
+     * processes (CLI + HTTP) cannot lose each other's changes.
+     *
+     * The callback receives the current config and returns the new one,
+     * or null to skip writing. Its other return values are not used.
+     *
+     * @param callable(array): ?array $mutate
+     */
+    public static function update(string $dataDir, callable $mutate): void
+    {
+        if (!is_dir($dataDir) && !mkdir($dataDir, 0700, true) && !is_dir($dataDir)) {
+            throw new \RuntimeException("Cannot create data directory: {$dataDir}");
+        }
+
+        $lockFile = self::getConfigFile($dataDir) . '.lock';
+        $lock     = fopen($lockFile, 'cb');
+        if ($lock === false) {
+            throw new \RuntimeException("Cannot open config lock: {$lockFile}");
+        }
+        @chmod($lockFile, 0600);
+
+        try {
+            if (!flock($lock, LOCK_EX)) {
+                throw new \RuntimeException("Cannot lock config: {$lockFile}");
+            }
+
+            $new = $mutate(self::readConfig($dataDir));
+            if ($new !== null) {
+                self::writeConfig($dataDir, $new);
+            }
+        } finally {
+            flock($lock, LOCK_UN);
+            fclose($lock);
+        }
     }
 }
-
