@@ -4,24 +4,73 @@ declare(strict_types=1);
 
 namespace Buckie\Thumbnail;
 
+use Buckie\Config\ConfigService;
+use Buckie\Errors\BuckieException;
 use Buckie\Storage\BucketService;
 use Buckie\Storage\LocalStorageService;
 
 /**
  * On-the-fly thumbnail generator using GD (preferred) or Imagick.
- * Thumbnails are cached alongside the originals in {WxH}/ subdirectories.
+ * Thumbnails are cached OUTSIDE the buckets, in the data directory's cache/
+ * folder, under a hashed file name. User input never reaches a file path.
  */
 class ThumbnailService
 {
+    public const MAX_DIMENSION   = 4096;
+    public const MAX_SOURCE_PIXELS = 64_000_000;
+    public const FORMATS         = ['webp', 'jpeg', 'png'];
+    public const FITS            = ['cover', 'contain', 'fill'];
+
     private bool $gdAvailable;
     private bool $imagickAvailable;
+    private string $cacheDir;
 
     public function __construct(
         private readonly BucketService $bucketService,
         private readonly LocalStorageService $storageService,
+        ?string $cacheDir = null,
     ) {
         $this->gdAvailable      = extension_loaded('gd');
         $this->imagickAvailable = extension_loaded('imagick');
+        $this->cacheDir         = ($cacheDir ?? ConfigService::getCacheDir(ConfigService::getDataDir())) . '/thumbnails';
+    }
+
+    /** Validate and normalize the output format ('jpg' is an alias of 'jpeg'). */
+    public static function normalizeFormat(string $format): string
+    {
+        $format = strtolower($format);
+        if ($format === 'jpg') {
+            $format = 'jpeg';
+        }
+        if (!in_array($format, self::FORMATS, true)) {
+            throw BuckieException::badRequest(
+                "Unsupported thumbnail format. Allowed: " . implode(', ', self::FORMATS),
+                'BUCKIE_THUMBNAIL_PARAM_INVALID'
+            );
+        }
+        return $format;
+    }
+
+    public static function normalizeFit(string $fit): string
+    {
+        if (!in_array($fit, self::FITS, true)) {
+            throw BuckieException::badRequest(
+                "Unsupported fit. Allowed: " . implode(', ', self::FITS),
+                'BUCKIE_THUMBNAIL_PARAM_INVALID'
+            );
+        }
+        return $fit;
+    }
+
+    public static function validateDimension(int $value, string $name): int
+    {
+        if ($value < 0 || $value > self::MAX_DIMENSION) {
+            throw BuckieException::badRequest(
+                "Thumbnail '{$name}' must be between 0 and " . self::MAX_DIMENSION,
+                'BUCKIE_THUMBNAIL_PARAM_INVALID'
+            );
+        }
+        return $value;
     }
 
     /**
@@ -36,6 +85,12 @@ class ThumbnailService
         string $fit    = 'cover',
         string $format = 'webp',
     ): ?string {
+        // Validate every parameter before touching the filesystem
+        $width  = self::validateDimension($width, 'w');
+        $height = self::validateDimension($height, 'h');
+        $fit    = self::normalizeFit($fit);
+        $format = self::normalizeFormat($format);
+
         if (!$this->gdAvailable && !$this->imagickAvailable) {
             return null;
         }
@@ -50,26 +105,32 @@ class ThumbnailService
             return null;
         }
 
-        // Build cache path: {bucket}/{WxH}/{key}.{format}
-        $dimKey     = "{$width}x{$height}";
-        $keyPath    = ltrim($key, '/');
-        $cacheFile  = dirname($originalPath) . "/{$dimKey}/" . pathinfo($key, PATHINFO_FILENAME) . ".{$format}";
-        $cacheDir   = dirname($cacheFile);
+        // Cache path: {dataDir}/cache/thumbnails/{hash}.{format}
+        $hash      = hash('sha256', implode('|', [$bucket['name'], $originalPath, $width, $height, $fit, $format]));
+        $cacheFile = $this->cacheDir . '/' . $hash . '.' . $format;
 
         // Serve from cache if fresh
-        if (file_exists($cacheFile) && filemtime($cacheFile) >= filemtime($originalPath)) {
+        if (is_file($cacheFile) && filemtime($cacheFile) >= filemtime($originalPath)) {
             return $cacheFile;
         }
 
-        if (!is_dir($cacheDir)) {
-            mkdir($cacheDir, 0755, true);
+        if (!is_dir($this->cacheDir) && !mkdir($this->cacheDir, 0700, true) && !is_dir($this->cacheDir)) {
+            return null;
         }
 
-        $generated = $this->gdAvailable
-            ? $this->generateWithGd($originalPath, $cacheFile, $width, $height, $fit, $format)
-            : $this->generateWithImagick($originalPath, $cacheFile, $width, $height, $fit, $format);
+        // Generate to a temp file, then rename, so readers never see a partial file
+        $tmpFile = $cacheFile . '.tmp.' . bin2hex(random_bytes(4));
 
-        return $generated ? $cacheFile : null;
+        $generated = $this->gdAvailable
+            ? $this->generateWithGd($originalPath, $tmpFile, $width, $height, $fit, $format)
+            : $this->generateWithImagick($originalPath, $tmpFile, $width, $height, $fit, $format);
+
+        if (!$generated || !rename($tmpFile, $cacheFile)) {
+            @unlink($tmpFile);
+            return null;
+        }
+
+        return $cacheFile;
     }
 
     public function getMimeType(string $format): string
@@ -78,7 +139,7 @@ class ThumbnailService
             'jpeg', 'jpg' => 'image/jpeg',
             'png'         => 'image/png',
             'webp'        => 'image/webp',
-            default       => 'image/jpeg',
+            default       => throw BuckieException::badRequest('Unsupported thumbnail format', 'BUCKIE_THUMBNAIL_PARAM_INVALID'),
         };
     }
 
@@ -93,7 +154,7 @@ class ThumbnailService
         string $format,
     ): bool {
         $info = @getimagesize($src);
-        if ($info === false) {
+        if ($info === false || ($info[0] * $info[1]) > self::MAX_SOURCE_PIXELS) {
             return false;
         }
 
@@ -137,7 +198,7 @@ class ThumbnailService
 
         $ok = match ($format) {
             'png'  => imagepng($dstImg, $dst, 8),
-            'webp' => function_exists('imagewebp') ? imagewebp($dstImg, $dst, 85) : imagejpeg($dstImg, $dst, 85),
+            'webp' => function_exists('imagewebp') && imagewebp($dstImg, $dst, 85),
             default => imagejpeg($dstImg, $dst, 85),
         };
 
@@ -157,7 +218,18 @@ class ThumbnailService
         string $fit,
         string $format,
     ): bool {
+        // Do not let Imagick sniff arbitrary coders: only accept plain raster types
+        $info = @getimagesize($src);
+        if ($info === false
+            || !in_array($info[2], [IMAGETYPE_JPEG, IMAGETYPE_PNG, IMAGETYPE_GIF, IMAGETYPE_WEBP, IMAGETYPE_BMP], true)
+            || ($info[0] * $info[1]) > self::MAX_SOURCE_PIXELS
+        ) {
+            return false;
+        }
+
         try {
+            \Imagick::setResourceLimit(\Imagick::RESOURCETYPE_MEMORY, 256 * 1024 * 1024);
+            \Imagick::setResourceLimit(\Imagick::RESOURCETYPE_TIME, 30);
             $img = new \Imagick($src);
             $img->setImageFormat($format === 'webp' ? 'webp' : ($format === 'png' ? 'png' : 'jpeg'));
 
@@ -178,7 +250,7 @@ class ThumbnailService
                 $img->setImageCompressionQuality(85);
             }
 
-            $img->writeImage($dst);
+            $img->writeImage(($format === 'jpeg' ? 'jpeg' : $format) . ':' . $dst);
             $img->destroy();
 
             return true;

@@ -128,7 +128,7 @@ if (in_array($subCmd, ['--help', '-h', 'help', '']) || $argc === 0) {
 }
 
 if (in_array($subCmd, ['--version', '-v'])) {
-    echo "buckie 1.0.0 (PHP " . PHP_VERSION . ")\n";
+    echo "buckie " . ConfigService::VERSION . " (PHP " . PHP_VERSION . ")\n";
     exit(0);
 }
 
@@ -203,7 +203,9 @@ switch ($subCmd) {
 
 function cmdServe(array $args): never
 {
-    $host    = getOption($args, '--host',      getenv('BUCKIE_HOST') ?: '0.0.0.0');
+    // The built-in PHP server is single-threaded and for development only:
+    // bind to loopback unless the operator explicitly asks for another host.
+    $host    = getOption($args, '--host',      getenv('BUCKIE_HOST') ?: '127.0.0.1');
     $port    = getOption($args, '--port',      getenv('BUCKIE_PORT') ?: '8080');
     $dataDir = getOption($args, '--data-dir',  ConfigService::getDataDir());
 
@@ -265,8 +267,28 @@ function cmdCreateIdentity(array $args): void
     $secret   = $args[1] ?? null;
     $dataDir  = getDataDirFromArgs($args);
 
-    if ($identity === null || $secret === null) {
-        printError('BUCKIE_INVALID_ARGS', 'Usage: buckie create identity <identity> <secret>');
+    if ($secret !== null && str_starts_with($secret, '--')) {
+        $secret = null; // an option, not a secret
+    }
+
+    if ($identity === null) {
+        printError('BUCKIE_INVALID_ARGS', 'Usage: buckie create identity <identity> [<secret>]  (or set BUCKIE_IDENTITY_SECRET, or pipe the secret on STDIN)');
+    }
+
+    if ($secret !== null) {
+        fwrite(STDERR, "[Buckie] Warning: a secret passed as an argument is visible in `ps` and shell history. Prefer BUCKIE_IDENTITY_SECRET, STDIN, or 'buckie provision'.\n");
+    } else {
+        $env = getenv('BUCKIE_IDENTITY_SECRET');
+        if ($env !== false && $env !== '') {
+            $secret = $env;
+        } elseif (!stream_isatty(STDIN)) {
+            $line   = fgets(STDIN);
+            $secret = $line === false ? null : rtrim($line, "\r\n");
+        }
+    }
+
+    if ($secret === null || $secret === '') {
+        printError('BUCKIE_INVALID_ARGS', 'A secret is required: pass it as an argument, set BUCKIE_IDENTITY_SECRET, or pipe it on STDIN');
     }
 
     $services = bootstrapServices($dataDir);
@@ -610,7 +632,7 @@ Options (most commands):
 
 Examples:
   buckie create bucket documents /mnt/storage/documents
-  buckie create identity erp-prod my-secret
+  BUCKIE_IDENTITY_SECRET=my-secret buckie create identity erp-prod
   buckie grant erp-prod documents --read --write --delete --prefix /tenant-a/
   buckie serve --port 8080
   buckie provision documents --read --write

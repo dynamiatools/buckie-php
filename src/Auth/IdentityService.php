@@ -33,9 +33,18 @@ class IdentityService
             'updatedAt'    => $now,
         ];
 
-        $cfg = ConfigService::readConfig($this->dataDir);
-        $cfg['identities'][] = $id;
-        ConfigService::writeConfig($this->dataDir, $cfg);
+        ConfigService::update($this->dataDir, function (array $cfg) use ($id, $identity): array {
+            foreach ($cfg['identities'] as $existing) {
+                if ($existing['identity'] === $identity) {
+                    throw BuckieException::conflict(
+                        "Identity '{$identity}' already exists",
+                        'BUCKIE_IDENTITY_ALREADY_EXISTS'
+                    );
+                }
+            }
+            $cfg['identities'][] = $id;
+            return $cfg;
+        });
 
         return $id;
     }
@@ -73,71 +82,88 @@ class IdentityService
     public function verify(string $identity, string $secret): ?array
     {
         $id = $this->find($identity);
-        if ($id === null) {
-            return null;
-        }
 
-        return password_verify($secret, $id['hashedSecret']) ? $id : null;
+        // Always run password_verify, even for unknown identities, so response
+        // time does not reveal which identities exist.
+        $hash  = $id['hashedSecret'] ?? self::dummyHash();
+        $valid = password_verify($secret, $hash);
+
+        return ($id !== null && $valid) ? $id : null;
     }
 
     public function grant(string $identity, array $grant): array
     {
-        $cfg = ConfigService::readConfig($this->dataDir);
-        $idx = $this->findIndex($cfg['identities'], $identity);
-
-        if ($idx < 0) {
-            throw BuckieException::notFound("Identity '{$identity}'");
+        foreach ($grant['prefixes'] ?? [] as $prefix) {
+            if (!is_string($prefix) || str_contains($prefix, "\0")
+                || in_array('..', explode('/', $prefix), true)
+            ) {
+                throw BuckieException::badRequest("Invalid grant prefix: {$prefix}", 'BUCKIE_PREFIX_INVALID');
+            }
         }
 
-        // Replace existing grant for the same bucket
-        $cfg['identities'][$idx]['grants'] = array_values(
-            array_filter(
-                $cfg['identities'][$idx]['grants'],
-                fn($g) => $g['bucket'] !== $grant['bucket']
-            )
-        );
-        $cfg['identities'][$idx]['grants'][] = $grant;
-        $cfg['identities'][$idx]['updatedAt'] = (new \DateTimeImmutable())->format(\DateTime::ATOM);
+        $result = null;
+        ConfigService::update($this->dataDir, function (array $cfg) use ($identity, $grant, &$result): array {
+            $idx = $this->findIndex($cfg['identities'], $identity);
+            if ($idx < 0) {
+                throw BuckieException::notFound("Identity '{$identity}'");
+            }
 
-        ConfigService::writeConfig($this->dataDir, $cfg);
-        return $cfg['identities'][$idx];
+            // Replace existing grant for the same bucket
+            $cfg['identities'][$idx]['grants'] = array_values(
+                array_filter(
+                    $cfg['identities'][$idx]['grants'],
+                    fn($g) => $g['bucket'] !== $grant['bucket']
+                )
+            );
+            $cfg['identities'][$idx]['grants'][] = $grant;
+            $cfg['identities'][$idx]['updatedAt'] = (new \DateTimeImmutable())->format(\DateTime::ATOM);
+
+            $result = $cfg['identities'][$idx];
+            return $cfg;
+        });
+
+        return $result;
     }
 
     public function revoke(string $identity, string $bucket): array
     {
-        $cfg = ConfigService::readConfig($this->dataDir);
-        $idx = $this->findIndex($cfg['identities'], $identity);
+        $result = null;
+        ConfigService::update($this->dataDir, function (array $cfg) use ($identity, $bucket, &$result): array {
+            $idx = $this->findIndex($cfg['identities'], $identity);
+            if ($idx < 0) {
+                throw BuckieException::notFound("Identity '{$identity}'");
+            }
 
-        if ($idx < 0) {
-            throw BuckieException::notFound("Identity '{$identity}'");
-        }
+            $cfg['identities'][$idx]['grants'] = array_values(
+                array_filter(
+                    $cfg['identities'][$idx]['grants'],
+                    fn($g) => $g['bucket'] !== $bucket
+                )
+            );
+            $cfg['identities'][$idx]['updatedAt'] = (new \DateTimeImmutable())->format(\DateTime::ATOM);
 
-        $cfg['identities'][$idx]['grants'] = array_values(
-            array_filter(
-                $cfg['identities'][$idx]['grants'],
-                fn($g) => $g['bucket'] !== $bucket
-            )
-        );
-        $cfg['identities'][$idx]['updatedAt'] = (new \DateTimeImmutable())->format(\DateTime::ATOM);
+            $result = $cfg['identities'][$idx];
+            return $cfg;
+        });
 
-        ConfigService::writeConfig($this->dataDir, $cfg);
-        return $cfg['identities'][$idx];
+        return $result;
     }
 
     public function delete(string $identity): void
     {
-        $cfg    = ConfigService::readConfig($this->dataDir);
-        $before = count($cfg['identities']);
+        ConfigService::update($this->dataDir, function (array $cfg) use ($identity): array {
+            $before = count($cfg['identities']);
 
-        $cfg['identities'] = array_values(
-            array_filter($cfg['identities'], fn($id) => $id['identity'] !== $identity)
-        );
+            $cfg['identities'] = array_values(
+                array_filter($cfg['identities'], fn($id) => $id['identity'] !== $identity)
+            );
 
-        if (count($cfg['identities']) === $before) {
-            throw BuckieException::notFound("Identity '{$identity}'");
-        }
+            if (count($cfg['identities']) === $before) {
+                throw BuckieException::notFound("Identity '{$identity}'");
+            }
 
-        ConfigService::writeConfig($this->dataDir, $cfg);
+            return $cfg;
+        });
     }
 
     // ── Permission check ──────────────────────────────────────────────────────
@@ -164,7 +190,7 @@ class IdentityService
 
             foreach ($prefixes as $prefix) {
                 $normalizedPrefix = str_starts_with($prefix, '/') ? $prefix : "/{$prefix}";
-                if ($normalizedPrefix === '/' || str_starts_with($normalizedKey, $normalizedPrefix)) {
+                if (self::matchesPrefix($normalizedKey, $normalizedPrefix)) {
                     return $grant;
                 }
             }
@@ -174,6 +200,28 @@ class IdentityService
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /**
+     * Prefix match that respects path-segment boundaries: '/tenant-a' matches
+     * '/tenant-a' and '/tenant-a/x' but never '/tenant-ab/x'.
+     * A prefix ending in '/' is already a segment boundary.
+     */
+    private static function matchesPrefix(string $key, string $prefix): bool
+    {
+        if ($prefix === '/') {
+            return true;
+        }
+        if (str_ends_with($prefix, '/')) {
+            return str_starts_with($key, $prefix);
+        }
+        return $key === $prefix || str_starts_with($key, $prefix . '/');
+    }
+
+    private static function dummyHash(): string
+    {
+        static $hash = null;
+        return $hash ??= password_hash('buckie-dummy-secret', PASSWORD_DEFAULT);
+    }
 
     private function findIndex(array $identities, string $name): int
     {

@@ -62,6 +62,11 @@ class BuckieException extends \RuntimeException
         return new self($buckieCode, $message, 400);
     }
 
+    public static function payloadTooLarge(int $limit): self
+    {
+        return new self('BUCKIE_PAYLOAD_TOO_LARGE', "Upload exceeds the maximum size of {$limit} bytes", 413);
+    }
+
     public static function pathTraversal(): self
     {
         return new self('BUCKIE_PATH_TRAVERSAL', 'Path traversal detected', 400);

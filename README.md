@@ -5,7 +5,7 @@
 
 # Buckie PHP
 
-PHP 8+ implementation of Buckie — a filesystem-native file server with a minimal S3-style REST API.
+PHP 8.1+ implementation of Buckie — a filesystem-native file server with a minimal S3-style REST API.
 
 Designed for **shared hosting and standard PHP environments**: no framework, no database, no message broker. Just PHP and a disk.
 
@@ -25,9 +25,9 @@ Designed for **shared hosting and standard PHP environments**: no framework, no 
 
 ## Features
 
-- **Zero external dependencies** — only PHP 8.0+ and standard extensions (GD, finfo)
+- **Zero external dependencies** — only PHP 8.1+ and standard extensions (GD, finfo)
 - **Single config file** — all state lives in `.buckie/config.json`
-- **On-the-fly thumbnails** — GD (default) or Imagick; automatic caching
+- **On-the-fly thumbnails** — GD (default) or Imagick; cached outside the buckets, with strict parameter limits
 - **Same REST API as the Node.js implementation**
 - **Same CLI contract as the Node.js implementation**
 - **Local FS only** — no SFTP; ideal for shared hosting
@@ -41,10 +41,11 @@ Designed for **shared hosting and standard PHP environments**: no framework, no 
 
 | Requirement | Minimum |
 |---|---|
-| PHP | **8.0** |
+| PHP | **8.1** (8.2+ to run the test suite) |
 | Composer | 2+ |
 | GD extension | any recent version (or Imagick) |
 | finfo extension | bundled with PHP 8 |
+| JSON extension | bundled with PHP 8 |
 
 ---
 
@@ -87,8 +88,9 @@ All management operations (buckets, identities, permissions, files) are handled 
 # Create a bucket
 php bin/buckie create bucket documents /var/storage/documents
 
-# Create an identity
-php bin/buckie create identity erp-prod my-secret-password
+# Create an identity (the secret is read from STDIN or BUCKIE_IDENTITY_SECRET,
+# so it never shows up in `ps` or your shell history)
+printf '%s' 'my-secret-password' | php bin/buckie create identity erp-prod
 
 # Grant permissions
 php bin/buckie grant erp-prod documents --read --write --delete --prefix /tenant-a/
@@ -131,6 +133,11 @@ Make sure `mod_rewrite` is enabled. The `public/.htaccess` file already contains
         AllowOverride All
         Require all granted
     </Directory>
+
+    # Never serve dotfiles
+    <FilesMatch "^\.">
+        Require all denied
+    </FilesMatch>
 </VirtualHost>
 ```
 
@@ -143,12 +150,18 @@ server {
     root /var/www/buckie/public;
     index index.php;
 
+    # Never serve dotfiles (.buckie, .git, ...)
+    location ~ /\. {
+        deny all;
+    }
+
     location / {
         try_files $uri $uri/ /index.php?$query_string;
     }
 
-    location ~ \.php$ {
-        fastcgi_pass unix:/run/php/php8.0-fpm.sock;
+    # Only index.php is executable; any other .php path is routed to Buckie like any other key
+    location = /index.php {
+        fastcgi_pass unix:/run/php/php8.2-fpm.sock;
         fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;
         include fastcgi_params;
     }
@@ -161,67 +174,72 @@ server {
 frankenphp php-server --root public/
 ```
 
-### Docker (pruebas locales con Apache)
+### Docker (local testing with Apache)
 
-El repositorio incluye un `Dockerfile` y un `docker-compose.yml` listos para pruebas locales.
+The repository ships a `Dockerfile` and a `docker-compose.yml` for local testing.
+Inside the container use the `buckie` wrapper: it runs the CLI as `www-data`, the user Apache runs as,
+so the private (`0600`) config file stays readable by the web server.
 
 ```bash
-
-# 1. Construir la imagen e iniciar el contenedor
+# 1. Build the image and start the container
 docker compose up --build -d
 
-# 2. Verificar que el servicio está activo
+# 2. Check that the service is up
 curl http://localhost:8080/health
 
-# 3. Crear un bucket (la ruta debe existir DENTRO del contenedor)
-docker exec buckie-php php bin/buckie create bucket docs /var/buckie-storage/docs
+# 3. Create a bucket (the path must exist INSIDE the container)
+docker exec buckie-php buckie create bucket docs /var/buckie-storage/docs
 
-# 4. Crear una identidad
-docker exec buckie-php php bin/buckie create identity dev-user secret123
+# 4. Create an identity (the secret is read from STDIN)
+printf '%s' 'secret123' | docker exec -i buckie-php buckie create identity dev-user
 
-# 5. Otorgar permisos
-docker exec buckie-php php bin/buckie grant dev-user docs --read --write --delete
+# 5. Grant permissions
+docker exec buckie-php buckie grant dev-user docs --read --write --delete
 
-# 6. Subir un archivo de prueba
+# 6. Upload a test file
 curl -X PUT http://localhost:8080/docs/hello.txt \
   -H "X-Buckie-Identity: dev-user" \
   -H "X-Buckie-Secret: secret123" \
   -H "Content-Type: text/plain" \
-  --data-binary "Hola desde Buckie PHP 🚀"
+  --data-binary "Hello from Buckie PHP"
 
-# 7. Descargar el archivo
+# 7. Download it
 curl http://localhost:8080/docs/hello.txt \
   -H "X-Buckie-Identity: dev-user" \
   -H "X-Buckie-Secret: secret123"
 
-# 8. Detener el contenedor
+# 8. Stop the container
 docker compose down
 ```
 
-Los datos persisten entre reinicios en `./docker-data/`:
+Data persists between restarts in `./docker-data/`:
 
 ```
 docker-data/
 ├── buckie/          ← config.json, logs/, cache/
-└── storage/         ← archivos subidos
+└── storage/         ← uploaded files
 ```
 
-**Variables de entorno disponibles** (configurables en `docker-compose.yml`):
+**Environment variables** (configurable in `docker-compose.yml`):
 
-| Variable | Default en Docker | Descripción |
+| Variable | Docker default | Description |
 |---|---|---|
-| `BUCKIE_DATA_DIR` | `/var/buckie-data` | Config, logs y caché |
-| `BUCKIE_STORAGE_DIR` | `/var/buckie-storage` | Almacenamiento de archivos |
-| `BUCKIE_LOG_LEVEL` | `debug` | Nivel de log |
+| `BUCKIE_DATA_DIR` | `/var/buckie-data` | Config, logs and cache |
+| `BUCKIE_STORAGE_DIR` | `/var/buckie-storage` | File storage |
+| `BUCKIE_LOG_LEVEL` | `debug` | Log level |
 
 ### Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `BUCKIE_DATA_DIR` | `<cwd>/.buckie` | Data directory (config, logs, cache) |
-| `BUCKIE_HOST` | `0.0.0.0` | Bind host (development server only) |
+| `BUCKIE_DATA_DIR` | `<project root>/.buckie` | Data directory (config, logs, cache). Set it explicitly in production and keep it **outside the web root** |
+| `BUCKIE_HOST` | `127.0.0.1` | Bind host (development server only) |
 | `BUCKIE_PORT` | `8080` | Bind port (development server only) |
 | `BUCKIE_LOG_LEVEL` | `info` | Log level |
+| `BUCKIE_MAX_UPLOAD_BYTES` | `0` (unlimited) | Maximum upload size in bytes. Over-limit uploads get `413`. PHP's own `upload_max_filesize`/`post_max_size` still apply |
+| `BUCKIE_FOLLOW_SYMLINKS` | _(unset)_ | Set to `1` to follow symlinks inside a bucket that point outside it (needed only if you deliberately link other disks into a bucket) |
+| `BUCKIE_TRUST_PROXY` | _(unset)_ | Set to `1` to log the client IP from `X-Forwarded-For`. Only enable it behind a proxy you control |
+| `BUCKIE_IDENTITY_SECRET` | _(unset)_ | Secret used by `buckie create identity` when none is passed as an argument |
 
 ---
 
@@ -237,7 +255,7 @@ php bin/buckie list buckets
 php bin/buckie remove bucket <name>
 
 # Identities
-php bin/buckie create identity <identity> <secret>
+php bin/buckie create identity <identity> [<secret>]   # secret: argument, BUCKIE_IDENTITY_SECRET or STDIN
 php bin/buckie list identities
 php bin/buckie remove identity <identity>
 
@@ -282,7 +300,10 @@ X-Buckie-Secret: my-secret-password
 GET /:bucket/:key?w=300&h=300&fit=cover&format=webp
 ```
 
-Supported query parameters: `w` (width), `h` (height), `fit` (`cover` | `contain` | `fill`), `format` (`webp` | `jpeg` | `png`).
+Supported query parameters: `w` (width), `h` (height), `fit` (`cover` | `contain` | `fill`), `format` (`webp` | `jpeg` | `png`; `jpg` is accepted as an alias).
+
+`w` and `h` must be integers between `0` and `4096`. Any invalid value is rejected with `400`
+(`BUCKIE_THUMBNAIL_PARAM_INVALID`). Thumbnails are cached in `<data dir>/cache/thumbnails/`, never inside the bucket.
 
 ### List a directory
 ```http
@@ -395,7 +416,8 @@ curl -X DELETE http://localhost:8080/documents/tenant-a/invoice.pdf \
  ├── logs/
  │   ├── access.log.jsonl
  │   └── error.log.jsonl
- └── cache/         # Reserved for future use
+ └── cache/
+      └── thumbnails/  # Generated thumbnails (hashed file names)
 ```
 
 Each local bucket also maintains an internal directory:
@@ -403,12 +425,49 @@ Each local bucket also maintains an internal directory:
 ```
 /path/to/bucket/
  ├── tenant-a/
- │    ├── invoice.pdf
- │    └── 300x300/
- │         └── photo.webp   ← Cached thumbnail
+ │    └── invoice.pdf
  └── .buckie/
       └── staging/          ← Temporary upload staging area
 ```
+
+---
+
+## Security notes
+
+- **Data directory**: `config.json` holds identity hashes and bucket paths. Keep `BUCKIE_DATA_DIR` outside the web root.
+  Buckie creates it with mode `0700` and `config.json` with `0600`, and refuses to overwrite a config it cannot parse.
+- **Grant prefixes** respect path-segment boundaries: `--prefix /tenant-a` covers `/tenant-a` and `/tenant-a/...`,
+  never `/tenant-ab/...`. Prefer a trailing slash (`/tenant-a/`) for clarity.
+- **Symlinks** that point outside a bucket are never followed, for reads, writes or deletes.
+- **Downloads** are sent with `X-Content-Type-Options: nosniff` and a sandboxing `Content-Security-Policy`;
+  HTML, SVG and script content is forced to `Content-Disposition: attachment`.
+- **No rate limiting** is built in. Put Buckie behind a reverse proxy (or WAF) that limits login attempts.
+- **Imagick**: if you use it instead of GD, install a restrictive ImageMagick `policy.xml`. Buckie only hands it
+  JPEG, PNG, GIF, WebP and BMP files, within memory and time limits.
+- The built-in server (`buckie serve`) is single-threaded, binds to `127.0.0.1` by default and is for development only.
+
+---
+
+## Upgrading from 1.0.0
+
+Your existing `config.json` (buckets, identities, grants, bcrypt hashes — also those created by the Node.js implementation)
+is read as is; nothing needs to be migrated. Its file mode and owner are preserved when Buckie rewrites it.
+
+Things worth checking before you deploy:
+
+| Area | Behavior now | What to check |
+|---|---|---|
+| Data directory | `BUCKIE_DATA_DIR`, else `<project root>/.buckie`, else a legacy `<cwd>/.buckie` **if it already contains a `config.json`** (a warning is logged). | Set `BUCKIE_DATA_DIR` explicitly and move it outside the web root if the warning shows up. |
+| Grant prefixes | A prefix without a trailing slash matches whole path segments: `/tenant-a` covers `/tenant-a/...` but **no longer** `/tenant-ab/...`. | Look for grants relying on partial-name matches, e.g. `--prefix /invoices-2024` meant to match `/invoices-2024-01.pdf`; change them to `--prefix /invoices-2024` + a directory layout, or list each prefix. Prefixes ending in `/` behave exactly as before. |
+| Symlinks in buckets | Symlinks that point **outside** the bucket are not followed. | Run `find <bucket path> -type l`. If you link other disks into a bucket on purpose, set `BUCKIE_FOLLOW_SYMLINKS=1`. A bucket path that is itself a symlink keeps working. |
+| Thumbnails | `format` must be `webp`, `jpeg`/`jpg` or `png` (otherwise `400`); `w`/`h` above 4096 are clamped; invalid sizes/fits behave as before. Thumbnails are now cached in `<data dir>/cache/thumbnails/`. | Old `WxH/` folders created inside your buckets are no longer used or deleted; remove them manually when convenient. |
+| Downloads | HTML, SVG and script files are sent as `attachment` and all responses carry `nosniff` and a sandbox CSP. | Pages that navigate directly to an HTML file served by Buckie will download it instead of rendering it. Images (including SVG in `<img>`) are unaffected. |
+| Unknown bucket | A GET on a bucket the identity has no grant for is `403` (it was `404`). | Clients that treat `404` specially. |
+| Client IP in logs | `REMOTE_ADDR`, unless `BUCKIE_TRUST_PROXY=1`. | Set it if Buckie runs behind your own reverse proxy. |
+| `buckie serve` | Binds to `127.0.0.1` (was `0.0.0.0`). | Pass `--host 0.0.0.0` or `BUCKIE_HOST` if you relied on it (development only). |
+| Docker | Run the CLI with the `buckie` wrapper (`docker exec <c> buckie ...`) so files belong to `www-data`. | Update scripts that use `docker exec <c> php bin/buckie ...`; those still work for reading but create root-owned files. |
+| Corrupt `config.json` | Invalid JSON now raises an error instead of being treated as empty (an empty file is still an empty config). | Fix or restore the file; Buckie will not overwrite it. |
+| PHP | The code needs PHP 8.1 (`readonly` properties); the declared minimum was wrongly `8.0`. | PHP 8.2+ is only needed to run the tests. |
 
 ---
 
