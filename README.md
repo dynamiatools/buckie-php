@@ -5,7 +5,7 @@
 
 # Buckie PHP
 
-PHP 8.2+ implementation of Buckie — a filesystem-native file server with a minimal S3-style REST API.
+PHP 8.1+ implementation of Buckie — a filesystem-native file server with a minimal S3-style REST API.
 
 Designed for **shared hosting and standard PHP environments**: no framework, no database, no message broker. Just PHP and a disk.
 
@@ -25,7 +25,7 @@ Designed for **shared hosting and standard PHP environments**: no framework, no 
 
 ## Features
 
-- **Zero external dependencies** — only PHP 8.2+ and standard extensions (GD, finfo)
+- **Zero external dependencies** — only PHP 8.1+ and standard extensions (GD, finfo)
 - **Single config file** — all state lives in `.buckie/config.json`
 - **On-the-fly thumbnails** — GD (default) or Imagick; cached outside the buckets, with strict parameter limits
 - **Same REST API as the Node.js implementation**
@@ -41,7 +41,7 @@ Designed for **shared hosting and standard PHP environments**: no framework, no 
 
 | Requirement | Minimum |
 |---|---|
-| PHP | **8.2** |
+| PHP | **8.1** (8.2+ to run the test suite) |
 | Composer | 2+ |
 | GD extension | any recent version (or Imagick) |
 | finfo extension | bundled with PHP 8 |
@@ -236,7 +236,8 @@ docker-data/
 | `BUCKIE_HOST` | `127.0.0.1` | Bind host (development server only) |
 | `BUCKIE_PORT` | `8080` | Bind port (development server only) |
 | `BUCKIE_LOG_LEVEL` | `info` | Log level |
-| `BUCKIE_MAX_UPLOAD_BYTES` | `536870912` (512 MiB) | Maximum upload size; `0` disables the limit. Over-limit uploads get `413` |
+| `BUCKIE_MAX_UPLOAD_BYTES` | `0` (unlimited) | Maximum upload size in bytes. Over-limit uploads get `413`. PHP's own `upload_max_filesize`/`post_max_size` still apply |
+| `BUCKIE_FOLLOW_SYMLINKS` | _(unset)_ | Set to `1` to follow symlinks inside a bucket that point outside it (needed only if you deliberately link other disks into a bucket) |
 | `BUCKIE_TRUST_PROXY` | _(unset)_ | Set to `1` to log the client IP from `X-Forwarded-For`. Only enable it behind a proxy you control |
 | `BUCKIE_IDENTITY_SECRET` | _(unset)_ | Secret used by `buckie create identity` when none is passed as an argument |
 
@@ -444,6 +445,29 @@ Each local bucket also maintains an internal directory:
 - **Imagick**: if you use it instead of GD, install a restrictive ImageMagick `policy.xml`. Buckie only hands it
   JPEG, PNG, GIF, WebP and BMP files, within memory and time limits.
 - The built-in server (`buckie serve`) is single-threaded, binds to `127.0.0.1` by default and is for development only.
+
+---
+
+## Upgrading from 1.0.0
+
+Your existing `config.json` (buckets, identities, grants, bcrypt hashes — also those created by the Node.js implementation)
+is read as is; nothing needs to be migrated. Its file mode and owner are preserved when Buckie rewrites it.
+
+Things worth checking before you deploy:
+
+| Area | Behavior now | What to check |
+|---|---|---|
+| Data directory | `BUCKIE_DATA_DIR`, else `<project root>/.buckie`, else a legacy `<cwd>/.buckie` **if it already contains a `config.json`** (a warning is logged). | Set `BUCKIE_DATA_DIR` explicitly and move it outside the web root if the warning shows up. |
+| Grant prefixes | A prefix without a trailing slash matches whole path segments: `/tenant-a` covers `/tenant-a/...` but **no longer** `/tenant-ab/...`. | Look for grants relying on partial-name matches, e.g. `--prefix /invoices-2024` meant to match `/invoices-2024-01.pdf`; change them to `--prefix /invoices-2024` + a directory layout, or list each prefix. Prefixes ending in `/` behave exactly as before. |
+| Symlinks in buckets | Symlinks that point **outside** the bucket are not followed. | Run `find <bucket path> -type l`. If you link other disks into a bucket on purpose, set `BUCKIE_FOLLOW_SYMLINKS=1`. A bucket path that is itself a symlink keeps working. |
+| Thumbnails | `format` must be `webp`, `jpeg`/`jpg` or `png` (otherwise `400`); `w`/`h` above 4096 are clamped; invalid sizes/fits behave as before. Thumbnails are now cached in `<data dir>/cache/thumbnails/`. | Old `WxH/` folders created inside your buckets are no longer used or deleted; remove them manually when convenient. |
+| Downloads | HTML, SVG and script files are sent as `attachment` and all responses carry `nosniff` and a sandbox CSP. | Pages that navigate directly to an HTML file served by Buckie will download it instead of rendering it. Images (including SVG in `<img>`) are unaffected. |
+| Unknown bucket | A GET on a bucket the identity has no grant for is `403` (it was `404`). | Clients that treat `404` specially. |
+| Client IP in logs | `REMOTE_ADDR`, unless `BUCKIE_TRUST_PROXY=1`. | Set it if Buckie runs behind your own reverse proxy. |
+| `buckie serve` | Binds to `127.0.0.1` (was `0.0.0.0`). | Pass `--host 0.0.0.0` or `BUCKIE_HOST` if you relied on it (development only). |
+| Docker | Run the CLI with the `buckie` wrapper (`docker exec <c> buckie ...`) so files belong to `www-data`. | Update scripts that use `docker exec <c> php bin/buckie ...`; those still work for reading but create root-owned files. |
+| Corrupt `config.json` | Invalid JSON now raises an error instead of being treated as empty (an empty file is still an empty config). | Fix or restore the file; Buckie will not overwrite it. |
+| PHP | The code needs PHP 8.1 (`readonly` properties); the declared minimum was wrongly `8.0`. | PHP 8.2+ is only needed to run the tests. |
 
 ---
 

@@ -147,11 +147,13 @@ class Router
         }
 
         // Thumbnail request (all parameters are validated; invalid values yield 400)
-        $w      = ThumbnailService::validateDimension(self::intParam('w'), 'w');
-        $h      = ThumbnailService::validateDimension(self::intParam('h'), 'h');
+        // Compatible with 1.0.0: non-numeric or negative sizes are ignored, unknown fits fall back
+        // to 'cover', and oversized values are clamped. Only the output format is strict.
+        $w = self::sizeParam('w');
+        $h = self::sizeParam('h');
 
         if ($w > 0 || $h > 0) {
-            $fit       = ThumbnailService::normalizeFit(self::stringParam('fit', 'cover'));
+            $fit       = in_array($_GET['fit'] ?? null, ThumbnailService::FITS, true) ? $_GET['fit'] : 'cover';
             $format    = ThumbnailService::normalizeFormat(self::stringParam('format', 'webp'));
             $thumbPath = $this->thumbnailService->getThumbnailPath($bucket, $key, $w, $h, $fit, $format);
 
@@ -400,16 +402,14 @@ class Router
         }
     }
 
-    private static function intParam(string $name): int
+    /** Thumbnail size: 0 when absent, negative or non-numeric; clamped to the maximum otherwise. */
+    private static function sizeParam(string $name): int
     {
-        if (!isset($_GET[$name])) {
+        $raw = $_GET[$name] ?? null;
+        if (!is_string($raw) || !preg_match('/^\d{1,9}$/', $raw)) {
             return 0;
         }
-        $raw = $_GET[$name];
-        if (!is_string($raw) || !preg_match('/^\d{1,9}$/', $raw)) {
-            throw BuckieException::badRequest("Invalid '{$name}' parameter", 'BUCKIE_THUMBNAIL_PARAM_INVALID');
-        }
-        return (int) $raw;
+        return min((int) $raw, ThumbnailService::MAX_DIMENSION);
     }
 
     private static function stringParam(string $name, string $default): string

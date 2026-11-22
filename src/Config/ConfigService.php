@@ -11,15 +11,49 @@ class ConfigService
     private const DEFAULT_PORT     = 8080;
     private const DEFAULT_HOST     = '0.0.0.0';
     private const DEFAULT_LOG_LEVEL = 'info';
-    private const DEFAULT_MAX_UPLOAD_BYTES = 536_870_912; // 512 MiB, matches the Docker PHP limits
+    private const DEFAULT_MAX_UPLOAD_BYTES = 0; // unlimited, as in 1.0.0; PHP's own limits still apply
 
     // ── Data directory resolution ─────────────────────────────────────────────
 
+    /**
+     * Resolve the data directory.
+     *
+     * Order: BUCKIE_DATA_DIR, then <project root>/.buckie, then (legacy, 1.0.0
+     * behavior) <cwd>/.buckie when it already holds a config.json. The cwd is
+     * never used for a NEW installation: under FPM/FrankenPHP it is often the
+     * webroot, which would expose config.json.
+     */
     public static function getDataDir(): string
     {
-        // Never derive the default from the current working directory: under
-        // FPM/FrankenPHP the cwd is often the webroot, which would expose config.json.
-        return getenv('BUCKIE_DATA_DIR') ?: (dirname(__DIR__, 2) . '/.buckie');
+        $env = getenv('BUCKIE_DATA_DIR');
+        if ($env !== false && $env !== '') {
+            return $env;
+        }
+
+        $default = dirname(__DIR__, 2) . '/.buckie';
+        if (is_file($default . '/config.json')) {
+            return $default;
+        }
+
+        $cwd = getcwd();
+        if ($cwd !== false && is_file($cwd . '/.buckie/config.json')) {
+            self::warnOnce(
+                "Using the legacy data directory '{$cwd}/.buckie' (derived from the working directory). "
+                . "Set BUCKIE_DATA_DIR to this path to make it explicit, and keep it outside the web root."
+            );
+            return $cwd . '/.buckie';
+        }
+
+        return $default;
+    }
+
+    private static function warnOnce(string $message): void
+    {
+        static $seen = [];
+        if (!isset($seen[$message])) {
+            $seen[$message] = true;
+            error_log('[Buckie] Warning: ' . $message);
+        }
     }
 
     public static function getHost(): string
@@ -33,11 +67,21 @@ class ConfigService
         return $env !== false ? (int) $env : self::DEFAULT_PORT;
     }
 
-    /** Maximum accepted upload size in bytes (BUCKIE_MAX_UPLOAD_BYTES); 0 means unlimited. */
+    /** Maximum accepted upload size in bytes (BUCKIE_MAX_UPLOAD_BYTES); 0 (default) means unlimited. */
     public static function getMaxUploadBytes(): int
     {
         $env = getenv('BUCKIE_MAX_UPLOAD_BYTES');
         return ($env !== false && ctype_digit($env)) ? (int) $env : self::DEFAULT_MAX_UPLOAD_BYTES;
+    }
+
+    /**
+     * Opt-in: follow symlinks inside a bucket even when they point outside it
+     * (BUCKIE_FOLLOW_SYMLINKS=1). Only for operators who deliberately link
+     * directories from other disks into a bucket.
+     */
+    public static function followExternalSymlinks(): bool
+    {
+        return getenv('BUCKIE_FOLLOW_SYMLINKS') === '1';
     }
 
     public static function getLogLevel(): string
@@ -98,6 +142,11 @@ class ConfigService
             throw new \RuntimeException("Cannot read config file: {$file}");
         }
 
+        // A zero-byte or whitespace-only file is an empty config (as in 1.0.0)
+        if (trim($raw) === '') {
+            return ['buckets' => [], 'identities' => []];
+        }
+
         $parsed = json_decode($raw, true);
         if (!is_array($parsed)) {
             throw new \RuntimeException("Config file is not valid JSON: {$file}");
@@ -122,13 +171,33 @@ class ConfigService
             throw new \RuntimeException('Failed to encode config as JSON');
         }
 
-        // Atomic write via temp file + rename (temp file is 0600 and cleaned up on failure)
+        // Keep the mode and owner of an existing config (the web server user may only be able to
+        // read it through them); a brand-new config is private (0600).
+        $mode = 0600;
+        $uid  = null;
+        $gid  = null;
+        $ref  = is_file($file) ? @stat($file) : false;
+        if ($ref !== false) {
+            $mode = $ref['mode'] & 0777;
+            $uid  = $ref['uid'];
+            $gid  = $ref['gid'];
+        } elseif (function_exists('posix_geteuid') && posix_geteuid() === 0 && ($dirStat = @stat($dataDir)) !== false) {
+            // Running as root (e.g. `docker exec`): hand the new file to the data dir's owner
+            $uid = $dirStat['uid'];
+            $gid = $dirStat['gid'];
+        }
+
+        // Atomic write via temp file + rename (cleaned up on failure)
         $tmp = $file . '.tmp.' . bin2hex(random_bytes(4));
         $fp  = @fopen($tmp, 'xb');
         if ($fp === false) {
             throw new \RuntimeException("Cannot create temp config file: {$tmp}");
         }
-        @chmod($tmp, 0600);
+        @chmod($tmp, $mode);
+        if ($uid !== null && function_exists('posix_geteuid') && posix_geteuid() === 0) {
+            @chown($tmp, $uid);
+            @chgrp($tmp, $gid);
+        }
 
         $ok = fwrite($fp, $json) === strlen($json);
         $ok = fclose($fp) && $ok;
@@ -155,14 +224,16 @@ class ConfigService
         }
 
         $lockFile = self::getConfigFile($dataDir) . '.lock';
-        $lock     = fopen($lockFile, 'cb');
-        if ($lock === false) {
-            throw new \RuntimeException("Cannot open config lock: {$lockFile}");
+        $lock     = @fopen($lockFile, 'cb');
+        if ($lock !== false) {
+            @chmod($lockFile, 0666 & ~umask());
         }
-        @chmod($lockFile, 0600);
+        // shortcut: if the lock file cannot be opened (e.g. it was created by another user), we fall
+        // back to the unlocked 1.0.0 behavior instead of failing. Revisit once all deployments
+        // run the CLI as a single user.
 
         try {
-            if (!flock($lock, LOCK_EX)) {
+            if ($lock !== false && !flock($lock, LOCK_EX)) {
                 throw new \RuntimeException("Cannot lock config: {$lockFile}");
             }
 
@@ -171,8 +242,10 @@ class ConfigService
                 self::writeConfig($dataDir, $new);
             }
         } finally {
-            flock($lock, LOCK_UN);
-            fclose($lock);
+            if ($lock !== false) {
+                flock($lock, LOCK_UN);
+                fclose($lock);
+            }
         }
     }
 }

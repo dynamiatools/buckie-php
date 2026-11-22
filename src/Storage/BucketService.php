@@ -151,7 +151,7 @@ class BucketService
         }
 
         // Symlink guard: the deepest existing ancestor must still live inside the bucket
-        if ($realRoot !== false && $resolved !== $bucketRoot) {
+        if ($realRoot !== false && $resolved !== $bucketRoot && !ConfigService::followExternalSymlinks()) {
             $probe = $resolved;
             while (!file_exists($probe) && !is_link($probe) && $probe !== $bucketRoot) {
                 $probe = dirname($probe);

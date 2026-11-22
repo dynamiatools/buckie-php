@@ -90,12 +90,8 @@ class RouterSecurityTest extends TestCase
             'php format'        => ['w=100&format=php'],
             'traversal format'  => ['w=100&format=x%2F..%2F..%2F..%2F..%2Fpublic%2Fa.php'],
             'gif format'        => ['w=100&format=gif'],
-            'huge width'        => ['w=50000&h=50000'],
-            'negative width'    => ['w=-5'],
-            'non numeric width' => ['w=abc'],
-            'array width'       => ['w[]=1'],
             'array format'      => ['w=10&format[]=png'],
-            'bad fit'           => ['w=10&fit=../../x'],
+            'null byte format'  => ['w=10&format=webp%00.php'],
         ];
     }
 
@@ -109,6 +105,38 @@ class RouterSecurityTest extends TestCase
 
         $this->assertSame(400, $res->status, $res->body);
         $this->assertSame($before, $this->snapshot());
+    }
+
+    /** Compatibility with 1.0.0: bad sizes/fits never produced an error. */
+    public function testOversizedThumbnailIsClampedInsteadOfRejected(): void
+    {
+        $this->requireGd();
+
+        $res = $this->request('GET', '/media/photo.png?w=50000&format=png');
+
+        $this->assertSame(200, $res->status);
+        $size = getimagesizefromstring($res->body);
+        $this->assertSame(4096, $size[0]);
+    }
+
+    public static function lenientQueries(): array
+    {
+        return [
+            'negative width'    => ['w=-5'],
+            'non numeric width' => ['w=abc'],
+            'array width'       => ['w[]=1'],
+            'unknown fit'       => ['w=10&fit=zoom'],
+        ];
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('lenientQueries')]
+    public function testLegacyLenientParametersStillSucceed(string $query): void
+    {
+        $this->requireGd();
+
+        $res = $this->request('GET', "/media/photo.png?{$query}");
+
+        $this->assertSame(200, $res->status);
     }
 
     public function testValidThumbnailIsServedFromCacheOutsideTheBucket(): void

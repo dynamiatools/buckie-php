@@ -75,7 +75,7 @@ class ConfigServiceTest extends TestCase
         $this->assertSame('{ not json', file_get_contents($this->tempDir . '/config.json'));
     }
 
-    public function testConfigFileIsPrivate(): void
+    public function testConfigFileIsPrivateWhenNew(): void
     {
         ConfigService::writeConfig($this->tempDir, ['buckets' => [], 'identities' => []]);
 
@@ -175,9 +175,9 @@ class ConfigServiceTest extends TestCase
         $this->assertSame(1024, ConfigService::getMaxUploadBytes());
 
         putenv('BUCKIE_MAX_UPLOAD_BYTES=abc');
-        $this->assertSame(536_870_912, ConfigService::getMaxUploadBytes());
+        $this->assertSame(0, ConfigService::getMaxUploadBytes());
 
         putenv('BUCKIE_MAX_UPLOAD_BYTES');
-        $this->assertSame(536_870_912, ConfigService::getMaxUploadBytes());
+        $this->assertSame(0, ConfigService::getMaxUploadBytes(), 'unlimited by default, like 1.0.0');
     }
 }
