@@ -27,6 +27,10 @@ COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 # --- Apache: enable mod_rewrite --------------
 RUN a2enmod rewrite
 
+# --- Apache: do not advertise the version ---
+RUN printf 'ServerTokens Prod\nServerSignature Off\n' > /etc/apache2/conf-available/zz-buckie-security.conf \
+    && a2enconf zz-buckie-security
+
 # --- Apache VirtualHost ----------------------
 COPY docker/apache-buckie.conf /etc/apache2/sites-available/buckie.conf
 RUN a2dissite 000-default.conf && a2ensite buckie.conf
@@ -36,7 +40,8 @@ RUN echo "upload_max_filesize = 512M\n\
 post_max_size = 512M\n\
 memory_limit = 256M\n\
 max_execution_time = 300\n\
-expose_php = Off" > /usr/local/etc/php/conf.d/buckie.ini
+expose_php = Off\n\
+display_errors = Off" > /usr/local/etc/php/conf.d/buckie.ini
 
 # --- Application source ----------------------
 WORKDIR /var/www/buckie
@@ -49,6 +54,13 @@ COPY . .
 # --- Entrypoint (permissions + start) --------
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
+
+ENV BUCKIE_DATA_DIR=/var/buckie-data
+
+# `buckie` wrapper: always runs the CLI as www-data, the user Apache runs as, so that
+# files it creates (config.json is 0600) stay readable by the web server.
+RUN printf '#!/bin/sh\nexec runuser -u www-data -- php /var/www/buckie/bin/buckie "$@"\n' > /usr/local/bin/buckie \
+    && chmod +x /usr/local/bin/buckie
 
 # Data dir & storage will be mounted as volumes
 VOLUME ["/var/buckie-data", "/var/buckie-storage"]

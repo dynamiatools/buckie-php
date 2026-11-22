@@ -1,0 +1,11 @@
+.git
+.github
+.idea
+.vscode
+vendor
+tests
+docker-data
+.buckie
+.env
+.env.*
+*.log
