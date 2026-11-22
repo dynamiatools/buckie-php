@@ -6,7 +6,7 @@ namespace Buckie\Config;
 
 class ConfigService
 {
-    public const VERSION = '1.0.0';
+    public const VERSION = '1.1.0';
 
     private const DEFAULT_PORT     = 8080;
     private const DEFAULT_HOST     = '0.0.0.0';
